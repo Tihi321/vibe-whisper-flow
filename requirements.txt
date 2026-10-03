@@ -1,0 +1,9 @@
+pynput
+sounddevice
+numpy
+pystray
+Pillow
+pywin32
+requests
+tomli-w
+pytest

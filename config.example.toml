@@ -1,0 +1,45 @@
+# VibeFlow configuration. Copied to config.toml on first run; edit config.toml.
+
+[hotkey]
+# Names: ctrl ctrl_l ctrl_r alt alt_l alt_r shift win caps_lock space f1..f24 a..z
+# Chords are joined with "+", e.g. "ctrl+shift+space". Single keys work too: "ctrl_r".
+chord = "ctrl+win"
+tap_ms = 300                 # press shorter than this counts as a tap
+double_tap_ms = 400          # second tap must start within this window (hands-free)
+max_recording_seconds = 300  # auto-stop (hands-free and hold)
+min_recording_seconds = 0.6  # shorter recordings are discarded
+
+[audio]
+device = ""                  # "" = Windows default input; or substring of the device name
+sample_rate = 16000
+silence_threshold = 0.01     # peak amplitude 0..1; quieter recordings are treated as silence and skipped
+
+[transcription]
+backend = "local"            # local | groq | openai
+language = "auto"            # "auto" or an ISO code like "en", "hr"
+
+[transcription.local]
+whisper_cli = "whisper/whisper-cli.exe"
+model = "whisper/models/ggml-small.bin"
+threads = 0                  # 0 = cpu count
+
+[transcription.cloud]
+groq_model = "whisper-large-v3-turbo"
+openai_model = "whisper-1"
+
+[cleanup]
+enabled = true
+provider = "lmstudio"        # lmstudio | groq | openai | anthropic | none
+base_url = "http://127.0.0.1:1234/v1"   # used by lmstudio (and any OpenAI-compatible server)
+model = ""                   # "" = first model LM Studio reports; set via tray picker
+timeout_seconds = 20
+prompt = ""                  # "" = built-in prompt
+
+[output]
+mode = "paste"               # paste | type
+restore_clipboard = false    # true = put previous text clipboard back after pasting
+paste_delay_ms = 60
+
+[ui]
+show_pill = true
+pill_position = "bottom"     # bottom | top
