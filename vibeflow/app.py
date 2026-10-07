@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import copy
+import ctypes
 import logging
 import os
 import sys
@@ -19,8 +21,10 @@ from .config import (
     config_path,
     load_config,
     load_env,
+    portable_path,
     resolve_path,
     save_config,
+    save_env,
 )
 from .logging_setup import setup_logging
 
@@ -242,13 +246,16 @@ class CleanupBreaker:
 
 
 class DictationApp:
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Config, start_hidden: bool = False, instance: Any = None):
         from . import audio, autostart, cleanup, inject, transcribe  # noqa: F401
         from .hotkeys import HotkeyListener, parse_chord
         from .overlay import Overlay
         from .tray import Tray, TrayHooks
 
         self.cfg = cfg
+        self._start_hidden = start_hidden
+        self._instance = instance
+        self.settings: Any = None
         self._audio = audio
         self._cleanup = cleanup
         self._inject = inject
@@ -296,7 +303,8 @@ class DictationApp:
             set_cleanup_model=self._set_cleanup_model,
             is_autostart=autostart.is_enabled,
             set_autostart=self._set_autostart,
-            open_config=lambda: os.startfile(str(config_path())),  # type: ignore[attr-defined]
+            open_settings=lambda: self.open_settings(),
+            open_config=self._open_config,
             open_logs=self._open_logs,
             reload_config=self.reload_config,
             quit=self.quit,
@@ -382,6 +390,16 @@ class DictationApp:
             self.tray.start()
         except Exception:
             log.exception("failed to start tray")
+        try:
+            self._autostart.sync()
+        except Exception:
+            log.exception("autostart sync failed")
+        if self._instance is not None:
+            try:
+                self._instance.watch(lambda: self.open_settings())
+            except Exception:
+                log.exception("single-instance watcher failed")
+        self._open_settings_on_start()
         if self._transcriber_error:
             self._startup_errors.append(self._transcriber_error)
         for msg in self._startup_errors:
@@ -392,6 +410,101 @@ class DictationApp:
                 pass
         self._startup_errors.clear()
 
+    def _settings_banner(self) -> str | None:
+        """Banner for the settings window while the transcriber is unavailable."""
+        if not self._transcriber_error:
+            return None
+        missing = (self.cfg.transcription.backend == "local"
+                   and not resolve_path(self.cfg.transcription.local.model).exists())
+        return ("Download a whisper model below to start dictating" if missing
+                else self._transcriber_error)
+
+    def _open_settings_on_start(self) -> None:
+        if self._transcriber_error:
+            self.open_settings()
+        elif self.cfg.ui.show_settings_on_start and not self._start_hidden:
+            self.open_settings()
+
+    # -- settings window
+    def _settings_window(self):
+        if self.settings is None:
+            from .settings_ui import SettingsHooks, SettingsWindow
+            hooks = SettingsHooks(
+                get_config=lambda: copy.deepcopy(self.cfg),
+                apply=self._settings_apply,
+                cleanup_models=self._settings_cleanup_models,
+                test_cleanup=self._settings_test_cleanup,
+                is_autostart=self._autostart.is_enabled,
+                set_autostart=self._set_autostart,
+                set_show_on_start=self._set_show_on_start,
+                whisper_dir=lambda: resolve_path(self.cfg.transcription.local.whisper_cli).parent,
+                models_dir=self._models_dir,
+                active_model_path=lambda: resolve_path(self.cfg.transcription.local.model),
+                open_logs=self._open_logs,
+                open_config=self._open_config,
+                audio_devices=self._audio_devices,
+                version=__version__,
+            )
+            self.settings = SettingsWindow(self.overlay.root, hooks, self.overlay.call_soon)
+        return self.settings
+
+    def open_settings(self, tab: str | None = None, banner: str | None = None) -> None:
+        """Thread-safe: show the settings window on the Tk thread."""
+        if banner is None:
+            banner = self._settings_banner()
+            if banner is not None and tab is None:
+                tab = "transcription"
+
+        def show() -> None:
+            try:
+                self._settings_window().show(tab, banner)
+            except Exception:
+                log.exception("could not open settings window")
+        self.overlay.call_soon(show)
+
+    def _settings_apply(self, cfg: Config, env_updates: dict[str, str]) -> str | None:
+        if env_updates:
+            save_env(env_updates)
+        save_config(cfg)
+        self.apply_config(cfg, "Settings saved")
+        return self._transcriber_error
+
+    def _settings_cleanup_models(self, refresh: bool) -> list[str]:
+        if self.cfg.cleanup.provider != "lmstudio":
+            return []
+        if refresh:
+            try:
+                models = self._cleanup.list_models(
+                    self.cfg.cleanup.base_url, os.environ.get("LMSTUDIO_API_KEY") or None)
+                self._models_cache = list(models)
+                self._models_at = time.monotonic()
+                self.tray.update_menu()
+            except Exception:
+                log.exception("model list refresh failed")
+        return list(self._models_cache)
+
+    def _settings_test_cleanup(self, cfg: Config, text: str) -> str:
+        cleaner = self._cleanup.make_cleaner(cfg.cleanup)
+        if cleaner is None:
+            raise RuntimeError("Cleanup is off or no model/API key is available")
+        return cleaner.clean(text)
+
+    def _set_show_on_start(self, value: bool) -> None:
+        self.cfg.ui.show_settings_on_start = bool(value)
+        self._save()
+
+    def _models_dir(self) -> Path:
+        return resolve_path(self.cfg.transcription.local.model).parent
+
+    def _audio_devices(self) -> list[str]:
+        try:
+            return [name for _, name in self._audio.list_input_devices()]
+        except Exception:
+            return []
+
+    def _open_config(self) -> None:
+        os.startfile(str(config_path()))  # type: ignore[attr-defined]
+
     def quit(self) -> None:
         with self._quit_lock:
             if self._quit_done:
@@ -399,7 +512,11 @@ class DictationApp:
             self._quit_done = True
         log.info("quitting")
         self._gen += 1
-        for step in (self.listener.stop, self.tray.stop, self.recorder.discard, self.overlay.quit):
+        steps = [self.listener.stop, self.tray.stop, self.recorder.discard]
+        if self._instance is not None:
+            steps.append(self._instance.close)
+        steps.append(self.overlay.quit)  # tears down the Tk root and the settings window with it
+        for step in steps:
             try:
                 step()
             except Exception:
@@ -411,6 +528,9 @@ class DictationApp:
         except Exception:
             log.exception("reload failed")
             return
+        self.apply_config(new, "Config reloaded")
+
+    def apply_config(self, new: Config, ok_message: str = "Settings saved") -> None:
         from .hotkeys import parse_chord
         self.cfg = new
         self.machine.cfg = new.hotkey
@@ -427,7 +547,7 @@ class DictationApp:
             self._flash("error", "Error: " + _short(self._transcriber_error, 53))
             self.tray.notify("VibeFlow", self._transcriber_error)
         else:
-            self._flash("ok", "Config reloaded")
+            self._flash("ok", ok_message)
 
     # -- overlay helpers
     def _flash(self, kind: str, text: str, seconds: float = 1.5) -> None:
@@ -584,7 +704,7 @@ class DictationApp:
         self._report_transcriber()
 
     def _set_whisper_model(self, model: str) -> None:
-        self.cfg.transcription.local.model = model
+        self.cfg.transcription.local.model = portable_path(Path(model))
         self.cfg.transcription.backend = "local"
         self._save()
         self._build_transcriber()
@@ -645,32 +765,61 @@ class DictationApp:
 
 # ---------------------------------------------------------------- entry point
 
+def _set_dpi_aware() -> None:
+    """Per-monitor DPI awareness; must run before any Tk window exists."""
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="vibeflow", description="System-wide AI dictation")
     parser.add_argument("--config", help="path to config.toml")
     parser.add_argument("--console", action="store_true", help="also log to stderr")
     parser.add_argument("--version", action="store_true")
+    parser.add_argument("--hidden", action="store_true",
+                        help="start in the tray without opening the settings window")
     args = parser.parse_args(argv)
     if args.version:
         print(f"vibeflow {__version__}")
         return 0
     if args.config:
         os.environ["VIBEFLOW_CONFIG"] = str(Path(args.config).resolve())
+    _set_dpi_aware()
+    inst = None
     try:
         load_env()
         log_path = setup_logging(console=args.console)
         log.info("VibeFlow %s starting; log=%s", __version__, log_path)
+        from .single_instance import SingleInstance
+        inst = SingleInstance()
+        if not inst.acquire():
+            log.info("another VibeFlow instance is running; asked it to show settings")
+            inst.signal_show()
+            inst.close()
+            inst = None
+            return 0
         cfg = load_config()
         log.info("effective hotkey=%s backend=%s cleanup=%s", cfg.hotkey.chord,
                  cfg.transcription.backend,
                  cfg.cleanup.provider if cfg.cleanup.enabled else "off")
-        DictationApp(cfg).run()
+        DictationApp(cfg, start_hidden=args.hidden, instance=inst).run()
         return 0
     except KeyboardInterrupt:
         return 0
     except Exception:
         log.exception("fatal error")
         return 1
+    finally:
+        if inst is not None:
+            try:
+                inst.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

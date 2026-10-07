@@ -52,7 +52,18 @@ class Overlay:
         self._dots = 0
         self._last_dots = 0.0
         self._last_render = ""
+        self._scale = 1.0
+        self._pill_h = PILL_H
+        self._pill_min_w = PILL_MIN_W
+        self._edge = EDGE_MARGIN
         self._width = PILL_MIN_W
+
+    @property
+    def root(self) -> tk.Tk | None:
+        return self._root
+
+    def _px(self, value: float) -> int:
+        return int(round(value * self._scale))
 
     # ---- thread-safe API -------------------------------------------
     def show(self, kind: str, text: str, ticking: bool = False) -> None:
@@ -77,6 +88,14 @@ class Overlay:
     def run(self, on_ready: Callable[[], None] | None = None) -> None:
         root = tk.Tk()
         self._root = root
+        try:
+            self._scale = max(1.0, float(root.winfo_fpixels("1i")) / 96.0)
+        except Exception:
+            self._scale = 1.0
+        self._pill_h = self._px(PILL_H)
+        self._pill_min_w = self._px(PILL_MIN_W)
+        self._edge = self._px(EDGE_MARGIN)
+        self._width = self._pill_min_w
         root.title("VibeFlow")
         root.overrideredirect(True)
         root.attributes("-topmost", True)
@@ -86,10 +105,10 @@ class Overlay:
         except tk.TclError:
             log.warning("transparentcolor not supported")
         self._font = tkfont.Font(root=root, family=FONT[0], size=FONT[1], weight=FONT[2])
-        self._canvas = tk.Canvas(root, width=PILL_MIN_W, height=PILL_H, bg=TRANSPARENT,
+        self._canvas = tk.Canvas(root, width=self._pill_min_w, height=self._pill_h, bg=TRANSPARENT,
                                  highlightthickness=0, bd=0)
         self._canvas.pack()
-        root.geometry(f"{PILL_MIN_W}x{PILL_H}+0+0")
+        root.geometry(f"{self._pill_min_w}x{self._pill_h}+0+0")
         root.update()
         self._apply_window_styles()
         root.withdraw()
@@ -213,25 +232,28 @@ class Overlay:
         c, root = self._canvas, self._root
         # reserve width for the longest dotted form so the pill does not jitter
         measure = label + ("..." if self._kind == "processing" else "")
-        width = max(PILL_MIN_W, self._font.measure(measure) + 64)
-        width = min(width, max(PILL_MIN_W, root.winfo_screenwidth() - 40))
+        width = max(self._pill_min_w, self._font.measure(measure) + self._px(64))
+        width = min(width, max(self._pill_min_w, root.winfo_screenwidth() - 40))
         c.delete("all")
         c.configure(width=width)
-        r = PILL_H // 2
-        c.create_oval(0, 0, PILL_H, PILL_H, fill=PILL_BG, outline=PILL_BG)
-        c.create_oval(width - PILL_H, 0, width, PILL_H, fill=PILL_BG, outline=PILL_BG)
-        c.create_rectangle(r, 0, width - r, PILL_H, fill=PILL_BG, outline=PILL_BG)
+        h = self._pill_h
+        r = h // 2
+        c.create_oval(0, 0, h, h, fill=PILL_BG, outline=PILL_BG)
+        c.create_oval(width - h, 0, width, h, fill=PILL_BG, outline=PILL_BG)
+        c.create_rectangle(r, 0, width - r, h, fill=PILL_BG, outline=PILL_BG)
         dot = DOT_COLORS.get(self._kind, "#ffffff")
-        c.create_oval(18, r - 6, 30, r + 6, fill=dot, outline=dot)
-        c.create_text(42, r, text=label, anchor="w", fill=TEXT_COLORS.get(self._kind, "#ffffff"), font=self._font)
+        dr = self._px(6)
+        c.create_oval(self._px(18), r - dr, self._px(18) + 2 * dr, r + dr, fill=dot, outline=dot)
+        c.create_text(self._px(42), r, text=label, anchor="w", fill=TEXT_COLORS.get(self._kind, "#ffffff"), font=self._font)
         self._place(width)
 
     def _place(self, width: int) -> None:
         root = self._root
         sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
         x = (sw - width) // 2
-        y = EDGE_MARGIN if self.cfg.pill_position == "top" else sh - PILL_H - EDGE_MARGIN
-        root.geometry(f"{width}x{PILL_H}+{x}+{y}")
+        h = self._pill_h
+        y = self._edge if self.cfg.pill_position == "top" else sh - h - self._edge
+        root.geometry(f"{width}x{h}+{x}+{y}")
         self._width = width
 
     def _tick(self) -> None:

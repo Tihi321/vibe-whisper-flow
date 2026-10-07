@@ -5,6 +5,7 @@ import dataclasses
 import logging
 import os
 import shutil
+import sys
 import tempfile
 import tomllib
 from dataclasses import dataclass, field
@@ -15,7 +16,23 @@ import tomli_w
 
 log = logging.getLogger(__name__)
 
-ROOT: Path = Path(__file__).resolve().parent.parent
+
+def _app_root() -> Path:
+    """Folder holding user data: next to the exe when frozen, else the repo root."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent.parent
+
+
+def _resources_root() -> Path:
+    """Folder holding bundled read-only resources (PyInstaller _MEIPASS when frozen)."""
+    if getattr(sys, "frozen", False):
+        return Path(getattr(sys, "_MEIPASS", None) or _app_root())
+    return ROOT
+
+
+ROOT: Path = _app_root()
+RESOURCES: Path = _resources_root()
 
 
 @dataclass
@@ -76,6 +93,7 @@ class OutputConfig:
 class UiConfig:
     show_pill: bool = True
     pill_position: str = "bottom"  # bottom | top
+    show_settings_on_start: bool = True
 
 
 @dataclass
@@ -96,6 +114,15 @@ def config_path() -> Path:
 def resolve_path(p: str | Path) -> Path:
     p = Path(p)
     return p if p.is_absolute() else ROOT / p
+
+
+def portable_path(p: str | Path) -> str:
+    """Path relative to ROOT (forward slashes) if inside it, else absolute."""
+    path = Path(p)
+    try:
+        return path.resolve().relative_to(ROOT.resolve()).as_posix()
+    except ValueError:
+        return str(path)
 
 
 # ---------------------------------------------------------------- dict <-> dataclass
@@ -157,7 +184,7 @@ def config_to_dict(cfg: Config) -> dict:
 def load_config(path: Path | None = None) -> Config:
     path = Path(path) if path else config_path()
     if not path.exists():
-        example = ROOT / "config.example.toml"
+        example = RESOURCES / "config.example.toml"
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             if example.exists():
@@ -224,8 +251,12 @@ def _parse_env_line(line: str) -> tuple[str, str] | None:
     return key, value
 
 
+def env_path() -> Path:
+    return ROOT / ".env"
+
+
 def load_env(path: Path | None = None) -> dict[str, str]:
-    path = Path(path) if path else ROOT / ".env"
+    path = Path(path) if path else env_path()
     try:
         text = path.read_text(encoding="utf-8-sig")
     except OSError:
@@ -239,6 +270,58 @@ def load_env(path: Path | None = None) -> dict[str, str]:
         result[key] = value
         os.environ.setdefault(key, value)
     return result
+
+
+def _format_env_value(value: str) -> str:
+    if any(c in value for c in " \t#\"'"):
+        return '"' + value.replace('"', "'") + '"'
+    return value
+
+
+def save_env(updates: dict[str, str], path: Path | None = None) -> None:
+    """Update KEY=VALUE lines in .env, keeping comments and unknown lines.
+
+    A blank value removes the key. os.environ is updated to match.
+    """
+    path = Path(path) if path else env_path()
+    try:
+        lines = path.read_text(encoding="utf-8-sig").splitlines()
+    except OSError:
+        lines = []
+    pending = {k: (v or "").strip() for k, v in updates.items()}
+    out: list[str] = []
+    done: set[str] = set()
+    for line in lines:
+        parsed = _parse_env_line(line)
+        key = parsed[0] if parsed else None
+        if key is not None and key in pending:
+            if key in done:
+                continue  # drop duplicate definitions
+            done.add(key)
+            if pending[key]:
+                out.append(f"{key}={_format_env_value(pending[key])}")
+            continue
+        out.append(line)
+    for key, value in pending.items():
+        if key not in done and value:
+            out.append(f"{key}={_format_env_value(value)}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("\n".join(out) + ("\n" if out else ""))
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    for key, value in pending.items():
+        if value:
+            os.environ[key] = value
+        else:
+            os.environ.pop(key, None)
 
 
 def get_secret(name: str) -> str | None:

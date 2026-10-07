@@ -9,6 +9,8 @@ Wispr-Flow-style dictation for Windows. Hold a hotkey, speak, release: the trans
 - Optional LLM cleanup of fillers, punctuation and casing: LM Studio (default), Groq, OpenAI, Anthropic
 - Tiny floating status pill that never steals focus
 - Tray icon: enable/disable, pick whisper model, pick cleanup model, launch at login
+- Settings window (tray left-click) for everything: hotkey, models, API keys, cleanup, output
+- Portable Windows build (`VibeFlow.exe`): no Python needed on the target machine
 - Programmable hotkey in `config.toml`
 
 ## Requirements
@@ -35,6 +37,8 @@ copy config.example.toml config.toml
 copy .env.example .env
 ```
 
+Instead of `setup-whisper.ps1` you can also download the engine and models from the **Transcription** tab of the Settings window (or `python -m vibeflow.whisper_setup --engine --models small`).
+
 Valid model names: `tiny`, `base`, `small`, `medium`, `large-v3`, `large-v3-turbo` (plus `.en` variants of the first four).
 
 ## Run
@@ -44,7 +48,34 @@ pythonw run.pyw            # background, no console window
 python run.pyw --console   # prints the log to the terminal
 ```
 
-A microphone icon appears in the tray. Right-click it for settings; **Quit** exits.
+A microphone icon appears in the tray. Left-click it to open the Settings window, right-click for quick menus; **Quit** (tray only) exits.
+
+`--hidden` starts without opening the Settings window (used by launch at login).
+
+## Settings window
+
+Open it with a left-click on the tray icon or **Settings...** in the tray menu. Tabs: **General**, **Transcription**, **Cleanup**, **API keys**, **About**.
+
+- Closing the window with **X** only hides it to the tray; **Quit** is available from the tray menu only.
+- The **Show this window when VibeFlow starts** checkbox is saved immediately. Uncheck it to start silently in the tray.
+- Launching VibeFlow again while it is already running brings the window up instead of starting a second copy.
+- Launch at login starts VibeFlow hidden (`--hidden`).
+- The Transcription tab downloads whisper models and the whisper engine (CPU or CUDA). API keys are written to `.env`.
+
+## Portable build (exe)
+
+Build (needs the venv from the Install section):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\build.ps1            # add -SkipTests to skip pytest, -Cuda for the CUDA engine
+```
+
+This produces `dist\VibeFlow\VibeFlow.exe` and `dist\VibeFlow-<version>-win64.zip` (PyInstaller one-folder build with the CPU whisper engine bundled; models are not).
+
+On another machine: unzip anywhere and run `VibeFlow.exe`. The first run opens the Settings window; download a model from the **Transcription** tab (for example `small`) and start dictating.
+
+- The exe is unsigned, so Windows SmartScreen may warn: click **More info**, then **Run anyway**.
+- All data lives next to `VibeFlow.exe`: `config.toml`, `.env`, `logs\` and `whisper\models\`. Copying the folder copies settings and API keys too.
 
 ## How to dictate
 
@@ -103,8 +134,10 @@ Text is inserted by setting the clipboard and sending Ctrl+V. By default the tra
 Tray: **Launch at login**. This writes `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\VibeFlow`:
 
 ```
-"C:\...\vibe-whisper-flow\.venv\Scripts\pythonw.exe" "C:\...\vibe-whisper-flow\run.pyw"
+"C:\...\vibe-whisper-flow\.venv\Scripts\pythonw.exe" "C:\...\vibe-whisper-flow\run.pyw" --hidden
 ```
+
+For the portable build it is `"C:\...\VibeFlow\VibeFlow.exe" --hidden`. If you move the folder, the entry is rewritten on the next start.
 
 ## Permissions on Windows
 
@@ -112,12 +145,12 @@ Windows has no equivalent of macOS "Accessibility" or "Input Monitoring" grants.
 
 What you do need:
 
-- **Microphone:** Settings > Privacy & security > Microphone: turn on **Microphone access** and **Let desktop apps access your microphone**. `python.exe` appears under desktop apps after first use.
+- **Microphone:** Settings > Privacy & security > Microphone: turn on **Microphone access** and **Let desktop apps access your microphone**. `VibeFlow.exe` (or `python.exe` when running from source) appears under desktop apps after first use.
 
 Caveats:
 
 - **Elevated apps (UIPI):** User Interface Privilege Isolation stops the hotkey and the paste from working in apps running as Administrator (elevated terminals, installers) unless VibeFlow is also launched elevated.
-- **Antivirus / EDR:** some products flag keyboard hooks. Allow-list the venv's `python.exe` / `pythonw.exe`.
+- **Antivirus / EDR:** some products flag keyboard hooks. Allow-list `VibeFlow.exe` (or the venv's `python.exe` / `pythonw.exe`).
 - **Controlled Folder Access** can block writing to `logs/`; allow the venv Python or move the project.
 - **Corporate policy** may block the Run key, which disables "Launch at login".
 - **Esc** is observed passively, so it still reaches the app you are typing in.
@@ -128,7 +161,7 @@ Caveats:
 | Problem | Fix |
 |---|---|
 | No tray icon | Run `python run.pyw --console` and read `logs\vibeflow.log`; check the hidden-icons overflow |
-| `whisper-cli.exe not found` | Re-run `scripts\setup-whisper.ps1`, or check `[transcription.local].whisper_cli` |
+| `whisper-cli.exe not found` | Install the engine from the Settings window (Transcription tab), re-run `scripts\setup-whisper.ps1`, or check `[transcription.local].whisper_cli` |
 | "No microphone" / wrong mic | Set `[audio].device` to part of the device name. List devices: `python -c "import sounddevice as sd; print(sd.query_devices())"` |
 | LM Studio unreachable | Check the server is started and the port matches `[cleanup].base_url`; the pill shows "Pasted (raw)" meanwhile |
 | Paste does nothing in some app | It is probably elevated (see Permissions), or use `[output].mode = "type"` |
@@ -145,7 +178,10 @@ With the local backend, audio never leaves your machine. Temporary WAV files in 
 run.pyw                  launcher (used by autostart)
 config.example.toml      copied to config.toml on first run
 .env.example             optional API keys
-scripts/setup-whisper.ps1  downloads whisper.cpp + models
+scripts/setup-whisper.ps1  downloads whisper.cpp + models (dev)
+scripts/build.ps1        builds the portable exe + zip
+packaging/VibeFlow.spec  PyInstaller spec
+requirements-build.txt   build dependencies (PyInstaller)
 vibeflow/
   app.py                 state machine, pipeline, wiring
   hotkeys.py             global hotkey listener, chord parsing
@@ -156,7 +192,10 @@ vibeflow/
   overlay.py             status pill (tkinter)
   tray.py                tray icon and menu
   autostart.py           Run-key launch at login
-  config.py              config + .env handling
+  config.py              config + .env handling, frozen-aware paths
+  settings_ui.py         Settings window (tkinter + sv-ttk)
+  whisper_setup.py       whisper engine + model downloader (also a CLI)
+  single_instance.py     one running copy; second launch shows the window
 tests/
 ```
 

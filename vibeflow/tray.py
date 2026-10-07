@@ -31,6 +31,7 @@ class TrayHooks:
     set_cleanup_model: Callable[[str | None], None]
     is_autostart: Callable[[], bool]
     set_autostart: Callable[[bool], None]
+    open_settings: Callable[[], None]
     open_config: Callable[[], None]
     open_logs: Callable[[], None]
     reload_config: Callable[[], None]
@@ -117,6 +118,7 @@ class Tray:
         clean_items.append(M("Refresh list", act(lambda: None)))  # act() calls update_menu()
 
         return [
+            M("Settings…", act(h.open_settings), default=True),
             M("Enabled", act(lambda: h.set_enabled(not h.is_enabled())), checked=chk(h.is_enabled)),
             pystray.Menu.SEPARATOR,
             M("Transcription", pystray.Menu(*trans_items)),

@@ -68,10 +68,10 @@ class LocalWhisper:
     def available(self) -> tuple[bool, str]:
         exe = self._exe()
         if not exe.exists():
-            return False, f"whisper executable not found: {exe} (run scripts/setup-whisper.ps1)"
+            return False, f"whisper executable not found: {exe} (install it in Settings > Transcription)"
         model = self._model()
         if not model.exists():
-            return False, f"whisper model not found: {model} (run scripts/setup-whisper.ps1)"
+            return False, f"whisper model not found: {model} (install it in Settings > Transcription)"
         return True, ""
 
     def _build_command(self, wav: Path, language: str) -> list[str]:
