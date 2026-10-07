@@ -19,7 +19,7 @@ def test_hooks_construct():
         cleanup_models=lambda: [], current_cleanup_model=lambda: None,
         set_cleanup_model=noop,
         is_autostart=lambda: False, set_autostart=noop,
-        open_config=noop, open_logs=noop, reload_config=noop, quit=noop,
+        open_settings=noop, open_config=noop, open_logs=noop, reload_config=noop, quit=noop,
     )
     assert hooks.is_enabled() is True
 
@@ -34,6 +34,6 @@ def test_update_menu_before_start_does_not_raise():
         cleanup_models=lambda: [], current_cleanup_model=lambda: None,
         set_cleanup_model=noop,
         is_autostart=lambda: False, set_autostart=noop,
-        open_config=noop, open_logs=noop, reload_config=noop, quit=noop,
+        open_settings=noop, open_config=noop, open_logs=noop, reload_config=noop, quit=noop,
     )
     Tray(hooks).update_menu()

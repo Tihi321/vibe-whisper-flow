@@ -16,10 +16,12 @@ dependencies = [
     "pywin32",
     "requests",
     "tomli-w",
+    "sv-ttk",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest"]
+build = ["pyinstaller"]
 
 [project.scripts]
 vibeflow = "vibeflow.app:main"

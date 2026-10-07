@@ -1,5 +1,7 @@
 import os
+import sys
 import tomllib
+from pathlib import Path
 
 from vibeflow import config
 from vibeflow.config import (Config, config_from_dict, config_to_dict, get_secret, load_config,
@@ -110,3 +112,56 @@ def test_env_missing(tmp_path):
 def test_resolve_path(tmp_path):
     assert resolve_path(tmp_path) == tmp_path
     assert resolve_path("whisper/x") == config.ROOT / "whisper" / "x"
+
+
+# ---------------------------------------------------------------- frozen paths / portable / save_env
+
+def test_app_root_frozen(monkeypatch, tmp_path):
+    exe = tmp_path / "VibeFlow.exe"
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", str(exe))
+    monkeypatch.setattr(sys, "_MEIPASS", str(tmp_path / "_internal"), raising=False)
+    assert config._app_root() == tmp_path.resolve()
+    assert config._resources_root() == Path(tmp_path / "_internal")
+
+
+def test_app_root_source(monkeypatch):
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    assert config._app_root() == Path(config.__file__).resolve().parent.parent
+    assert config._resources_root() == config.ROOT
+
+
+def test_portable_path(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "ROOT", tmp_path)
+    inside = tmp_path / "whisper" / "models" / "ggml-small.bin"
+    assert config.portable_path(inside) == "whisper/models/ggml-small.bin"
+    outside = tmp_path.parent / "elsewhere" / "m.bin"
+    assert config.portable_path(outside) == str(outside)
+
+
+def test_show_settings_on_start_default():
+    assert config.Config().ui.show_settings_on_start is True
+
+
+def test_save_env_roundtrip(monkeypatch, tmp_path):
+    p = tmp_path / ".env"
+    p.write_text("# keys\nGROQ_API_KEY=old\nexport OPENAI_API_KEY=abc\nOTHER=keep\n", encoding="utf-8")
+    monkeypatch.setenv("GROQ_API_KEY", "old")
+    monkeypatch.setenv("OPENAI_API_KEY", "abc")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    config.save_env({"GROQ_API_KEY": "new", "OPENAI_API_KEY": "  ", "ANTHROPIC_API_KEY": "sk x#1"}, p)
+    lines = p.read_text(encoding="utf-8").splitlines()
+    assert lines == ["# keys", "GROQ_API_KEY=new", "OTHER=keep", 'ANTHROPIC_API_KEY="sk x#1"']
+    assert os.environ["GROQ_API_KEY"] == "new"
+    assert "OPENAI_API_KEY" not in os.environ
+    assert os.environ["ANTHROPIC_API_KEY"] == "sk x#1"
+    monkeypatch.delenv("ANTHROPIC_API_KEY")
+    assert config.load_env(p)["ANTHROPIC_API_KEY"] == "sk x#1"
+
+
+def test_save_env_creates_file(monkeypatch, tmp_path):
+    p = tmp_path / "sub" / ".env"
+    monkeypatch.delenv("LMSTUDIO_API_KEY", raising=False)
+    config.save_env({"LMSTUDIO_API_KEY": "k"}, p)
+    assert p.read_text(encoding="utf-8") == "LMSTUDIO_API_KEY=k\n"
+    monkeypatch.delenv("LMSTUDIO_API_KEY")

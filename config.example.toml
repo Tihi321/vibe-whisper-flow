@@ -43,3 +43,4 @@ paste_delay_ms = 60
 [ui]
 show_pill = true
 pill_position = "bottom"     # bottom | top
+show_settings_on_start = true  # open the Settings window when VibeFlow starts

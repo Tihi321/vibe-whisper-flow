@@ -8,3 +8,5 @@ __pycache__/
 .claude/temp/
 .pytest_cache/
 *.egg-info/
+build/
+dist/
