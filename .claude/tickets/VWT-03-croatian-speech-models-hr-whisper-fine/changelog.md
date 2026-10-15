@@ -1,5 +1,27 @@
 # VWT-03 changelog
 
+## 2026-10-15 (later) — Fix Parakeet in the portable build
+
+Outcome: in the portable exe, picking Parakeet failed with "onnx-asr is not available
+(PackageNotFoundError: No package metadata was found for onnx-asr)". Cause: `onnx_asr/__init__.py` calls
+`importlib.metadata.version("onnx-asr")` on import, and PyInstaller didn't bundle the dist-info. A frozen exe
+has no pip, so the fix is to bundle the metadata, not to offer an install from the UI.
+
+### Files changed
+- `packaging/VibeFlow.spec`: `copy_metadata("onnx-asr") + copy_metadata("onnxruntime")` added to datas.
+- `vibeflow/parakeet.py`: in the frozen build, the unavailable message no longer says `pip install`. It now
+  says the engine is missing from the build.
+
+### Verification
+- `scripts\build.ps1`: 196 tests passed, and the build and zip succeeded. `onnx_asr-0.12.0.dist-info` and
+  `onnxruntime-1.31.0.dist-info` are in `dist/VibeFlow/_internal`.
+- Ran `dist\VibeFlow\VibeFlow.exe` with a temp config (`backend = "parakeet"`, model_dir pointing at the
+  installed Parakeet files). The log shows `parakeet model loaded from D:\Programs\VibeFlow\whisper\models\parakeet-tdt-0.6b-v3`
+  about 3 s after start.
+- Not run: hotkey dictation through the exe.
+
+Commit status: uncommitted.
+
 ## 2026-10-15 — Croatian fine-tuned Whisper model + Parakeet v3 backend
 
 Outcome: two new ways to dictate Croatian. One is a downloadable Croatian fine-tune of whisper large-v3-turbo

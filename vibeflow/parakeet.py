@@ -5,6 +5,7 @@ import hashlib
 import logging
 import os
 import shutil
+import sys
 import threading
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -122,6 +123,9 @@ class ParakeetTranscriber:
     def available(self) -> tuple[bool, str]:
         err = _onnx_asr_import_error()
         if err:
+            if getattr(sys, "frozen", False):  # no pip in the portable build: it must be bundled
+                return False, (f"The Parakeet engine (onnx-asr) is missing from this build ({err}). "
+                               "Download the latest VibeFlow release.")
             return False, (f"onnx-asr is not available ({err}); install it with "
                            "pip install onnx-asr[cpu]")
         d = self._dir()
