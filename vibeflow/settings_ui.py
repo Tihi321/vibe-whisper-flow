@@ -470,20 +470,25 @@ class SettingsWindow:
                                          ("groq", "Groq API"), ("openai", "OpenAI API"))):
             ttk.Radiobutton(be, text=text, value=val, variable=be_var).grid(
                 row=0, column=i, sticky="w", padx=(0, 16))
-        ttk.Label(be, text="Parakeet detects the language automatically; Language setting is "
-                  "ignored.", foreground="gray").grid(row=1, column=0, columnspan=4,
-                                                      sticky="w", pady=(4, 0))
+        self._parakeet_hint = ttk.Label(
+            be, text="Parakeet detects the language automatically (25 European languages, "
+            "incl. Croatian).", foreground="gray")
+        self._parakeet_hint.grid(row=1, column=0, columnspan=4, sticky="w", pady=(4, 0))
         opts = ttk.Frame(f)
-        opts.pack(fill="x", pady=(8, 0))
         self._combo(opts, 0, "Language", "language", LANGUAGES, 10)
         self._model_combo = self._combo(opts, 1, "Local model", "local_model", [], 30,
                                         readonly=True)
         self._entry(opts, 2, "Threads", "threads", 6, hint="0 = automatic")
         self._entry(opts, 3, "Groq model", "groq_model", 28)
         self._entry(opts, 4, "OpenAI model", "openai_model", 28)
+        # option rows (label + field + hint) shown per backend
+        self._backend_rows = {
+            row: (opts.grid_slaves(row=row), backends) for row, backends in (
+                (0, ("local", "groq", "openai")), (1, ("local",)), (2, ("local",)),
+                (3, ("groq",)), (4, ("openai",)))
+        }
 
         mm = ttk.LabelFrame(f, text="Model manager", padding=8)
-        mm.pack(fill="both", expand=True, pady=(8, 0))
         cols = ("name", "size", "status")
         self._tree = ttk.Treeview(mm, columns=cols, show="headings", height=6, selectmode="browse")
         for c, w, t in (("name", 150, "Model"), ("size", 80, "Size"), ("status", 160, "Status")):
@@ -515,7 +520,6 @@ class SettingsWindow:
         self._progress_label.grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
         en = ttk.LabelFrame(f, text="Whisper engine", padding=8)
-        en.pack(fill="x", pady=(8, 0))
         self._engine_label = ttk.Label(en, text="")
         self._engine_label.pack(side="left")
         self._cuda_btn = ttk.Button(en, text="Install CUDA (NVIDIA)",
@@ -524,6 +528,40 @@ class SettingsWindow:
         self._cpu_btn = ttk.Button(en, text="Install CPU",
                                    command=lambda: self._install_engine(False))
         self._cpu_btn.pack(side="right", padx=6)
+
+        # sections in pack order with their pack options and the backends that show them
+        self._backend_sections = (
+            (opts, {"fill": "x", "pady": (8, 0)}, ("local", "groq", "openai")),
+            (mm, {"fill": "both", "expand": True, "pady": (8, 0)}, ("local", "parakeet")),
+            (en, {"fill": "x", "pady": (8, 0)}, ("local",)),
+        )
+        be_var.trace_add("write", lambda *_: self._show_backend_options())
+        self._show_backend_options()
+
+    def _show_backend_options(self) -> None:
+        """Show only the options, model rows and sections that belong to the selected backend."""
+        backend = str(self._vars["backend"].get())
+        for widgets, backends in self._backend_rows.values():
+            for w in widgets:
+                if backend in backends:
+                    w.grid()
+                else:
+                    w.grid_remove()
+        if backend == "parakeet":
+            self._parakeet_hint.grid()
+        else:
+            self._parakeet_hint.grid_remove()
+        for frame, _, _ in self._backend_sections:
+            frame.pack_forget()
+        for frame, pack_opts, backends in self._backend_sections:
+            if backend in backends:
+                frame.pack(**pack_opts)
+        wanted = [parakeet.MODEL_NAME] if backend == "parakeet" else list(whisper_setup.MODELS)
+        self._tree.selection_set(())
+        for iid in (*whisper_setup.MODELS, parakeet.MODEL_NAME):
+            self._tree.detach(iid)
+        for i, iid in enumerate(wanted):
+            self._tree.move(iid, "", i)
 
     def _refresh_models(self) -> None:
         mdir = self.hooks.models_dir()

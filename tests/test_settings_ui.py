@@ -126,6 +126,46 @@ def test_window_smoke(tmp_path, monkeypatch):
         root.destroy()
 
 
+def test_backend_shows_only_its_options(tmp_path):
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("no display")
+    root.withdraw()
+    try:
+        win = SettingsWindow(root, _hooks(Config(), tmp_path, []), lambda fn: fn())
+        win.show("transcription")
+        root.update()
+
+        def shown(row: int) -> bool:
+            return all(w.winfo_manager() == "grid" for w in win._backend_rows[row][0])
+
+        def sections() -> list[bool]:
+            return [bool(frame.winfo_manager()) for frame, _, _ in win._backend_sections]
+
+        assert shown(1) and not shown(3) and sections() == [True, True, True]
+        assert win._tree.get_children() == tuple(settings_ui.whisper_setup.MODELS)
+
+        win._vars["backend"].set("parakeet")
+        root.update()
+        assert sections() == [False, True, False]
+        assert win._tree.get_children() == (settings_ui.parakeet.MODEL_NAME,)
+        assert win._parakeet_hint.winfo_manager() == "grid"
+
+        win._vars["backend"].set("groq")
+        root.update()
+        assert shown(0) and shown(3) and not shown(1) and not shown(4)
+        assert sections() == [True, False, False]
+        assert win._parakeet_hint.winfo_manager() == ""
+
+        win._vars["backend"].set("local")
+        root.update()
+        assert sections() == [True, True, True] and shown(2)
+        assert win._tree.get_children() == tuple(settings_ui.whisper_setup.MODELS)
+    finally:
+        root.destroy()
+
+
 def test_parakeet_backend_accepted():
     cfg = Config()
     cfg.transcription.backend = "parakeet"

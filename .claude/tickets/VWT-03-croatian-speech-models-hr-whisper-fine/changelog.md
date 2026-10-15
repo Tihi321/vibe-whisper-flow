@@ -1,5 +1,16 @@
 # VWT-03 changelog
 
+## 2026-10-15 (later) — Per-backend options in the Transcription tab
+
+Outcome: Settings > Transcription now shows only what belongs to the selected backend.
+- `vibeflow/settings_ui.py`: Local shows Language, Local model, Threads, the whisper rows in the model manager
+  and Whisper engine. Parakeet shows its hint and only the Parakeet row. Groq and OpenAI show Language plus
+  their own model field. It updates on a backend change through a trace on the backend variable (grid_remove,
+  pack_forget and tree detach/move).
+- `tests/test_settings_ui.py`: `test_backend_shows_only_its_options`.
+
+Verification: `pytest -q` gives 197 passed. I checked screenshots of the local, parakeet and groq layouts.
+
 ## 2026-10-15 (later) — Fix Parakeet in the portable build
 
 Outcome: in the portable exe, picking Parakeet failed with "onnx-asr is not available
