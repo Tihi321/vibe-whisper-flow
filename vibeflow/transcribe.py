@@ -1,4 +1,4 @@
-"""Speech-to-text backends: local whisper.cpp CLI and Groq/OpenAI Whisper APIs."""
+"""Speech-to-text backends: local whisper.cpp CLI, local Parakeet (onnx-asr) and Groq/OpenAI Whisper APIs."""
 from __future__ import annotations
 
 import logging
@@ -87,7 +87,10 @@ class LocalWhisper:
             "-otxt",
             "-of", str(base),
         ]
-        cmd += ["-l", language or "auto"]
+        language = language or "auto"
+        if language == "auto" and "-turbo-hr" in self._model().name:
+            language = "hr"  # monolingual fine-tune: auto-detect is unreliable
+        cmd += ["-l", language]
         return cmd
 
     def cancel(self) -> None:
@@ -209,6 +212,14 @@ def make_transcriber(cfg: TranscriptionConfig) -> Transcriber:
     backend = (cfg.backend or "").lower()
     if backend == "local":
         t = LocalWhisper(cfg.local)
+        ok, reason = t.available()
+        if not ok:
+            raise TranscriptionError(reason)
+        return t
+    if backend == "parakeet":
+        from .parakeet import ParakeetTranscriber  # lazy: onnx-asr is optional at import time
+
+        t = ParakeetTranscriber(cfg.parakeet)
         ok, reason = t.available()
         if not ok:
             raise TranscriptionError(reason)

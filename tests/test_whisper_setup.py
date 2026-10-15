@@ -126,3 +126,35 @@ def test_engine_installed(tmp_path):
     assert not ws.engine_installed(tmp_path)
     (tmp_path / "main.exe").write_bytes(b"x")
     assert ws.engine_installed(tmp_path)
+
+
+def test_hr_model_url_and_filename():
+    for name in ("large-v3-turbo-hr", "large-v3-turbo-hr-q5"):
+        url = ws.model_url(name)
+        assert url.startswith("https://huggingface.co/JoaoZaokk/whisper-large-v3-turbo-hr-parla-ggml/"
+                              "resolve/8280f145eaae746f586e4d681504ca7e3ad95b0f/")
+        assert name in ws.CROATIAN_ONLY
+    assert ws.model_url("large-v3-turbo-hr").endswith("-q8_0.bin")
+    assert ws.model_url("large-v3-turbo-hr-q5").endswith("-q5_0.bin")
+    assert ws.model_filename("large-v3-turbo-hr") == "ggml-large-v3-turbo-hr.bin"
+    assert "small" not in ws.CROATIAN_ONLY
+
+
+def test_download_hr_model_verifies_sha(monkeypatch, tmp_path):
+    import hashlib
+
+    data = b"z" * 1_100_000
+    monkeypatch.setitem(ws._EXTERNAL, "large-v3-turbo-hr",
+                        (ws.model_url("large-v3-turbo-hr"), hashlib.sha256(data).hexdigest()))
+    monkeypatch.setattr(ws.requests, "get", lambda *a, **k: FakeResp([data[:500_000], data[500_000:]]))
+    out = ws.download_model("large-v3-turbo-hr", tmp_path)
+    assert out == tmp_path / "ggml-large-v3-turbo-hr.bin"
+    assert out.read_bytes() == data
+    assert not (tmp_path / "ggml-large-v3-turbo-hr.bin.part").exists()
+
+
+def test_download_hr_model_sha_mismatch_removes_part(monkeypatch, tmp_path):
+    monkeypatch.setattr(ws.requests, "get", lambda *a, **k: FakeResp([b"not the model" * 1000]))
+    with pytest.raises(ws.SetupError, match="Checksum mismatch"):
+        ws.download_model("large-v3-turbo-hr", tmp_path)
+    assert list(tmp_path.iterdir()) == []

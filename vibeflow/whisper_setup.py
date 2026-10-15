@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import logging
 import os
 import re
@@ -31,7 +32,24 @@ MODELS: dict[str, int] = {
     "medium.en": 1_530_000_000,
     "large-v3-turbo": 1_620_000_000,
     "large-v3": 3_100_000_000,
+    "large-v3-turbo-hr": 874_188_075,
+    "large-v3-turbo-hr-q5": 574_041_195,
 }
+
+# Models not hosted in ggerganov/whisper.cpp: name -> (pinned url, sha256).
+_HR_BASE = ("https://huggingface.co/JoaoZaokk/whisper-large-v3-turbo-hr-parla-ggml/resolve/"
+            "8280f145eaae746f586e4d681504ca7e3ad95b0f/")
+_EXTERNAL: dict[str, tuple[str, str]] = {
+    "large-v3-turbo-hr": (
+        _HR_BASE + "ggml-whisper-large-v3-turbo-hr-parla-q8_0.bin",
+        "29b73250e1f190bf60fb2394e7b6e76faed417aedbd622bdca6ccb90825be88c"),
+    "large-v3-turbo-hr-q5": (
+        _HR_BASE + "ggml-whisper-large-v3-turbo-hr-parla-q5_0.bin",
+        "945a3d2fe71af09fa170b36832821b7cfec0e1b600e62aac847dba2b16f2942c"),
+}
+
+# Croatian fine-tunes: they lost English and other languages, so they only make sense for hr.
+CROATIAN_ONLY = {"large-v3-turbo-hr", "large-v3-turbo-hr-q5"}
 
 RELEASES_URL = "https://api.github.com/repos/ggml-org/whisper.cpp/releases?per_page=20"
 USER_AGENT = "vibeflow-setup"
@@ -64,6 +82,8 @@ def model_filename(name: str) -> str:
 
 def model_url(name: str) -> str:
     _check_model(name)
+    if name in _EXTERNAL:
+        return _EXTERNAL[name][0]
     return f"https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-{name}.bin"
 
 
@@ -95,8 +115,12 @@ def engine_installed(dest: Path) -> bool:
 
 
 def _stream_to(url: str, target: Path, progress: ProgressFn | None,
-               cancel: threading.Event | None, headers: dict | None = None) -> None:
-    """Stream url into target (a .part path chosen by the caller). Caller cleans up on error."""
+               cancel: threading.Event | None, headers: dict | None = None,
+               hasher: "hashlib._Hash | None" = None) -> None:
+    """Stream url into target (a .part path chosen by the caller). Caller cleans up on error.
+
+    If hasher is given, every written chunk is fed to it so the caller can verify the digest.
+    """
     try:
         resp = requests.get(url, stream=True, timeout=30, headers=headers or {"User-Agent": USER_AGENT})
     except requests.RequestException as e:
@@ -119,6 +143,8 @@ def _stream_to(url: str, target: Path, progress: ProgressFn | None,
                     if not chunk:
                         continue
                     fh.write(chunk)
+                    if hasher is not None:
+                        hasher.update(chunk)
                     done += len(chunk)
                     if progress:
                         progress(done, total)
@@ -148,8 +174,13 @@ def download_model(name: str, models_dir: Path, progress: ProgressFn | None = No
     if final.is_file() and final.stat().st_size > _MIN_MODEL_BYTES:
         return final
     part = final.with_name(final.name + ".part")
+    expected = _EXTERNAL[name][1] if name in _EXTERNAL else None
+    hasher = hashlib.sha256() if expected else None
     try:
-        _stream_to(url, part, progress, cancel)
+        _stream_to(url, part, progress, cancel, hasher=hasher)
+        if hasher is not None and hasher.hexdigest() != expected:
+            raise SetupError(f"Checksum mismatch for {name}: expected {expected}, "
+                             f"got {hasher.hexdigest()}. The download was discarded.")
         os.replace(part, final)
     except BaseException:
         _unlink(part)

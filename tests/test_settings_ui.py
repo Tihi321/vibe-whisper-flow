@@ -124,3 +124,15 @@ def test_window_smoke(tmp_path, monkeypatch):
         assert applied and applied[-1][0].hotkey.tap_ms == 250
     finally:
         root.destroy()
+
+
+def test_parakeet_backend_accepted():
+    cfg = Config()
+    cfg.transcription.backend = "parakeet"
+    form = form_from_config(cfg)
+    assert config_from_form(Config(), form).transcription.backend == "parakeet"
+    form["local_model"] = ""  # no whisper model needed for parakeet
+    assert config_from_form(Config(), form).transcription.backend == "parakeet"
+    form["backend"] = "local"
+    with pytest.raises(ValueError):
+        config_from_form(Config(), form)

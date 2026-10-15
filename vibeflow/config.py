@@ -59,6 +59,12 @@ class LocalWhisperConfig:
 
 
 @dataclass
+class ParakeetConfig:
+    model_dir: str = "whisper/models/parakeet-tdt-0.6b-v3"
+    threads: int = 0  # 0 = onnxruntime default
+
+
+@dataclass
 class CloudWhisperConfig:
     groq_model: str = "whisper-large-v3-turbo"
     openai_model: str = "whisper-1"
@@ -66,9 +72,10 @@ class CloudWhisperConfig:
 
 @dataclass
 class TranscriptionConfig:
-    backend: str = "local"  # local | groq | openai
+    backend: str = "local"  # local | parakeet | groq | openai
     language: str = "auto"
     local: LocalWhisperConfig = field(default_factory=LocalWhisperConfig)
+    parakeet: ParakeetConfig = field(default_factory=ParakeetConfig)
     cloud: CloudWhisperConfig = field(default_factory=CloudWhisperConfig)
 
 

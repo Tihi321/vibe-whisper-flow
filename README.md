@@ -112,8 +112,17 @@ The keyboard hook is passive: the keys also reach the focused app. Prefer modifi
 ## Transcription backends
 
 - **Local (default):** whisper.cpp. `small` is fast, `medium` is more accurate. Switch in the tray (**Transcription**) or set `[transcription.local].model`.
+- **Local (Parakeet v3):** NVIDIA Parakeet-TDT-0.6B-v3 through [onnx-asr](https://github.com/istupakov/onnx-asr) (CPU, about 670 MB, 25 European languages including Croatian, language is detected automatically). Download it in **Settings > Transcription > Model manager** (`parakeet-tdt-0.6b-v3`), then pick **Local (Parakeet v3)**. Long recordings are split with a Silero VAD. The `language` setting is ignored.
 - **Groq / OpenAI API:** put keys in `.env` (`GROQ_API_KEY`, `OPENAI_API_KEY`), then pick the API in the tray or set `[transcription].backend = "groq"` / `"openai"`. Audio is uploaded in that case.
 - **Language:** `[transcription].language = "auto"` or an ISO code such as `"en"`, `"hr"`. A fixed language is faster and more reliable than auto-detect.
+
+### Croatian
+
+Whisper `small` is weak on Croatian. Better options, in Settings > Transcription:
+
+- **`large-v3-turbo-hr (Croatian only)`**: a Croatian fine-tune of Whisper large-v3-turbo ([GoranS/whisper-large-v3-turbo-hr-parla](https://huggingface.co/GoranS/whisper-large-v3-turbo-hr-parla), ggml build by JoaoZaokk, Apache-2.0; about 874 MB, `-q5` is 574 MB). Best Croatian accuracy of the options here (FLEURS WER about 8.7). It only understands Croatian: English and other languages come out mangled. With Language set to `auto`, VibeFlow forces `-l hr` for this model. The download is pinned to a specific commit and verified with SHA-256.
+- **Parakeet v3** (see above): multilingual, fast on CPU, automatic language detection (FLEURS hr WER about 12.5), a good pick if you switch between Croatian and English.
+- `large-v3` / `large-v3-turbo`: multilingual Whisper (hr WER about 11 to 13), slower.
 
 ## LLM cleanup
 

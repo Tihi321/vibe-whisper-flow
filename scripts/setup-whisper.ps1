@@ -15,7 +15,13 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
 
-$validModels = @("tiny", "tiny.en", "base", "base.en", "small", "small.en", "medium", "medium.en", "large-v3", "large-v3-turbo")
+$validModels = @("tiny", "tiny.en", "base", "base.en", "small", "small.en", "medium", "medium.en", "large-v3", "large-v3-turbo", "large-v3-turbo-hr", "large-v3-turbo-hr-q5")
+# Models hosted outside ggerganov/whisper.cpp: pinned URL + sha256 (keep in sync with vibeflow/whisper_setup.py).
+$hrBase = "https://huggingface.co/JoaoZaokk/whisper-large-v3-turbo-hr-parla-ggml/resolve/8280f145eaae746f586e4d681504ca7e3ad95b0f/"
+$externalModels = @{
+    "large-v3-turbo-hr"    = @{ Url = "${hrBase}ggml-whisper-large-v3-turbo-hr-parla-q8_0.bin"; Sha256 = "29b73250e1f190bf60fb2394e7b6e76faed417aedbd622bdca6ccb90825be88c" }
+    "large-v3-turbo-hr-q5" = @{ Url = "${hrBase}ggml-whisper-large-v3-turbo-hr-parla-q5_0.bin"; Sha256 = "945a3d2fe71af09fa170b36832821b7cfec0e1b600e62aac847dba2b16f2942c" }
+}
 $Models = @($Models | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 foreach ($m in $Models) {
     if ($validModels -notcontains $m) {
@@ -94,10 +100,24 @@ foreach ($m in $Models) {
         Write-Host "Model $m already present, skipping"
         continue
     }
-    $url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-$m.bin"
+    $expectedHash = $null
+    if ($externalModels.ContainsKey($m)) {
+        $url = $externalModels[$m].Url
+        $expectedHash = $externalModels[$m].Sha256
+        Write-Host "Note: $m is a Croatian-only fine-tune (English and other languages are not supported)."
+    } else {
+        $url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-$m.bin"
+    }
     Write-Host "Downloading model $m (this can take a while)..."
     $tmp = "$file.part"
     Invoke-WebRequest -Uri $url -OutFile $tmp -UseBasicParsing
+    if ($expectedHash) {
+        $actual = (Get-FileHash -Path $tmp -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($actual -ne $expectedHash) {
+            Remove-Item -Path $tmp -Force -ErrorAction SilentlyContinue
+            throw "Checksum mismatch for ${m}: expected $expectedHash, got $actual. The download was discarded."
+        }
+    }
     Move-Item -Path $tmp -Destination $file -Force
 }
 
