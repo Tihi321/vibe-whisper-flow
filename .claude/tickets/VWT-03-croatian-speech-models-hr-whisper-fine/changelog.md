@@ -20,7 +20,7 @@ has no pip, so the fix is to bundle the metadata, not to offer an install from t
   about 3 s after start.
 - Not run: hotkey dictation through the exe.
 
-Commit status: uncommitted.
+Commit status: committed as 3889aa2 on `VWT-03_croatian-asr-models` (not pushed).
 
 ## 2026-10-15 — Croatian fine-tuned Whisper model + Parakeet v3 backend
 
