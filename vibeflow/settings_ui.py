@@ -13,9 +13,9 @@ from pathlib import Path
 from tkinter import messagebox, ttk
 from typing import Any, Callable
 
-from . import whisper_setup
+from . import parakeet, whisper_setup
 from .cleanup import DEFAULT_PROMPT
-from .config import ROOT, Config, portable_path
+from .config import ROOT, Config, portable_path, resolve_path
 from .hotkeys import parse_chord
 
 try:  # optional: UI still works (with the stock ttk theme) without it
@@ -28,7 +28,7 @@ log = logging.getLogger(__name__)
 TABS = ("general", "transcription", "cleanup", "keys", "about")
 TAB_TITLES = {"general": "General", "transcription": "Transcription", "cleanup": "Cleanup",
               "keys": "API keys", "about": "About"}
-BACKENDS = ("local", "groq", "openai")
+BACKENDS = ("local", "parakeet", "groq", "openai")
 PROVIDERS = ("lmstudio", "groq", "openai", "anthropic", "none")
 LANGUAGES = ("auto", "en", "hr", "de", "fr", "es", "it", "pt", "nl", "pl", "ru", "uk", "ja", "zh")
 OUTPUT_MODES = ("paste", "type")
@@ -142,7 +142,7 @@ def config_from_form(base: Config, form: dict[str, Any]) -> Config:
         old = base.transcription.local.model
         cut = max(old.rfind("/"), old.rfind("\\"))
         t.local.model = (old[: cut + 1] + model) if cut >= 0 else model
-    elif not model:
+    elif not model and t.backend == "local":
         raise ValueError("Pick a local whisper model (or download one first)")
     t.local.threads = _int(form, "threads", "Threads", 0)
     t.cloud.groq_model = str(form.get("groq_model", "")).strip() or t.cloud.groq_model
@@ -466,20 +466,29 @@ class SettingsWindow:
         be.pack(fill="x")
         be_var = self._var("backend", "local")
         for i, (val, text) in enumerate((("local", "Local (whisper.cpp)"),
+                                         ("parakeet", "Local (Parakeet v3)"),
                                          ("groq", "Groq API"), ("openai", "OpenAI API"))):
             ttk.Radiobutton(be, text=text, value=val, variable=be_var).grid(
                 row=0, column=i, sticky="w", padx=(0, 16))
+        self._parakeet_hint = ttk.Label(
+            be, text="Parakeet detects the language automatically (25 European languages, "
+            "incl. Croatian).", foreground="gray")
+        self._parakeet_hint.grid(row=1, column=0, columnspan=4, sticky="w", pady=(4, 0))
         opts = ttk.Frame(f)
-        opts.pack(fill="x", pady=(8, 0))
         self._combo(opts, 0, "Language", "language", LANGUAGES, 10)
         self._model_combo = self._combo(opts, 1, "Local model", "local_model", [], 30,
                                         readonly=True)
         self._entry(opts, 2, "Threads", "threads", 6, hint="0 = automatic")
         self._entry(opts, 3, "Groq model", "groq_model", 28)
         self._entry(opts, 4, "OpenAI model", "openai_model", 28)
+        # option rows (label + field + hint) shown per backend
+        self._backend_rows = {
+            row: (opts.grid_slaves(row=row), backends) for row, backends in (
+                (0, ("local", "groq", "openai")), (1, ("local",)), (2, ("local",)),
+                (3, ("groq",)), (4, ("openai",)))
+        }
 
         mm = ttk.LabelFrame(f, text="Model manager", padding=8)
-        mm.pack(fill="both", expand=True, pady=(8, 0))
         cols = ("name", "size", "status")
         self._tree = ttk.Treeview(mm, columns=cols, show="headings", height=6, selectmode="browse")
         for c, w, t in (("name", 150, "Model"), ("size", 80, "Size"), ("status", 160, "Status")):
@@ -492,7 +501,10 @@ class SettingsWindow:
         mm.columnconfigure(0, weight=1)
         mm.rowconfigure(0, weight=1)
         for name, size in whisper_setup.MODELS.items():
-            self._tree.insert("", "end", iid=name, values=(name, _fmt_size(size), ""))
+            label = f"{name} (Croatian only)" if name in whisper_setup.CROATIAN_ONLY else name
+            self._tree.insert("", "end", iid=name, values=(label, _fmt_size(size), ""))
+        self._tree.insert("", "end", iid=parakeet.MODEL_NAME, values=(
+            parakeet.MODEL_NAME, _fmt_size(parakeet.TOTAL_BYTES), ""))
         btns = ttk.Frame(mm)
         btns.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         self._dl_btn = ttk.Button(btns, text="Download", command=self._download_selected)
@@ -508,7 +520,6 @@ class SettingsWindow:
         self._progress_label.grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
         en = ttk.LabelFrame(f, text="Whisper engine", padding=8)
-        en.pack(fill="x", pady=(8, 0))
         self._engine_label = ttk.Label(en, text="")
         self._engine_label.pack(side="left")
         self._cuda_btn = ttk.Button(en, text="Install CUDA (NVIDIA)",
@@ -517,6 +528,40 @@ class SettingsWindow:
         self._cpu_btn = ttk.Button(en, text="Install CPU",
                                    command=lambda: self._install_engine(False))
         self._cpu_btn.pack(side="right", padx=6)
+
+        # sections in pack order with their pack options and the backends that show them
+        self._backend_sections = (
+            (opts, {"fill": "x", "pady": (8, 0)}, ("local", "groq", "openai")),
+            (mm, {"fill": "both", "expand": True, "pady": (8, 0)}, ("local", "parakeet")),
+            (en, {"fill": "x", "pady": (8, 0)}, ("local",)),
+        )
+        be_var.trace_add("write", lambda *_: self._show_backend_options())
+        self._show_backend_options()
+
+    def _show_backend_options(self) -> None:
+        """Show only the options, model rows and sections that belong to the selected backend."""
+        backend = str(self._vars["backend"].get())
+        for widgets, backends in self._backend_rows.values():
+            for w in widgets:
+                if backend in backends:
+                    w.grid()
+                else:
+                    w.grid_remove()
+        if backend == "parakeet":
+            self._parakeet_hint.grid()
+        else:
+            self._parakeet_hint.grid_remove()
+        for frame, _, _ in self._backend_sections:
+            frame.pack_forget()
+        for frame, pack_opts, backends in self._backend_sections:
+            if backend in backends:
+                frame.pack(**pack_opts)
+        wanted = [parakeet.MODEL_NAME] if backend == "parakeet" else list(whisper_setup.MODELS)
+        self._tree.selection_set(())
+        for iid in (*whisper_setup.MODELS, parakeet.MODEL_NAME):
+            self._tree.detach(iid)
+        for i, iid in enumerate(wanted):
+            self._tree.move(iid, "", i)
 
     def _refresh_models(self) -> None:
         mdir = self.hooks.models_dir()
@@ -541,7 +586,12 @@ class SettingsWindow:
         if current and current not in files:
             files.append(current)
         self._model_combo.configure(values=files)
+        pk = parakeet.installed(self._parakeet_dir())
+        self._tree.set(parakeet.MODEL_NAME, "status", "Installed" if pk else "Not installed")
         self._refresh_engine()
+
+    def _parakeet_dir(self) -> Path:
+        return resolve_path(self.hooks.get_config().transcription.parakeet.model_dir)
 
     def _refresh_engine(self) -> None:
         try:
@@ -611,14 +661,20 @@ class SettingsWindow:
             if not name:
                 self._set_status("Select a model in the list first.")
             return
-        fn = whisper_setup.model_filename(name)
-        if (self.hooks.models_dir() / fn).exists():
+        is_pk = name == parakeet.MODEL_NAME
+        if is_pk:
+            have = parakeet.installed(self._parakeet_dir())
+        else:
+            have = (self.hooks.models_dir() / whisper_setup.model_filename(name)).exists()
+        if have:
             self._set_status(f"{name} is already installed.")
             return
         cb = self._progress_cb(f"Downloading {name}")
         cancel = self._cancel
 
         def work() -> Path:
+            if is_pk:
+                return parakeet.download(self._parakeet_dir(), cb, cancel)
             return whisper_setup.download_model(name, self.hooks.models_dir(), cb, cancel)
 
         def done(result: Any, err: Exception | None) -> None:
@@ -629,7 +685,8 @@ class SettingsWindow:
                 messagebox.showerror("Download failed", str(err), parent=self.top)
             else:
                 self._set_status(f"Downloaded {name}.")
-                self._auto_select(name)
+                if not is_pk:
+                    self._auto_select(name)
         self._run_worker(f"Downloading {name}", work, done)
 
     def _auto_select(self, name: str) -> None:
@@ -655,6 +712,9 @@ class SettingsWindow:
         name = self._selected_model()
         if self._busy or not name:
             return
+        if name == parakeet.MODEL_NAME:
+            self._delete_parakeet()
+            return
         fn = whisper_setup.model_filename(name)
         path = self.hooks.models_dir() / fn
         if not path.exists():
@@ -668,6 +728,25 @@ class SettingsWindow:
             return
         try:
             path.unlink()
+        except OSError as e:
+            messagebox.showerror("Delete failed", str(e), parent=self.top)
+        self._refresh_models()
+
+    def _delete_parakeet(self) -> None:
+        path = self._parakeet_dir()
+        if not path.exists():
+            self._set_status(f"{parakeet.MODEL_NAME} is not installed.")
+            return
+        if (self.hooks.get_config().transcription.backend == "parakeet"
+                or str(self._vars["backend"].get()) == "parakeet"):
+            messagebox.showinfo("VibeFlow", "Parakeet is the active backend. Switch to another "
+                                "backend first.", parent=self.top)
+            return
+        if not messagebox.askyesno("Delete model", f"Delete {parakeet.MODEL_NAME}?",
+                                   parent=self.top):
+            return
+        try:
+            parakeet.delete(path)
         except OSError as e:
             messagebox.showerror("Delete failed", str(e), parent=self.top)
         self._refresh_models()

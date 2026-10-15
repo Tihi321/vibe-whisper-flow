@@ -101,3 +101,131 @@ def test_make_transcriber_local_unavailable(tmp_path):
     cfg = TranscriptionConfig(backend="local", local=_cfg(tmp_path))
     with pytest.raises(TranscriptionError):
         make_transcriber(cfg)
+
+
+def test_hr_model_auto_forces_hr(tmp_path):
+    cfg = _cfg(tmp_path)
+    cfg.model = str(tmp_path / "ggml-large-v3-turbo-hr.bin")
+    lw = LocalWhisper(cfg)
+    wav = tmp_path / "x.wav"
+    assert lw._build_command(wav, "auto")[-1] == "hr"
+    assert lw._build_command(wav, "")[-1] == "hr"
+    cmd = lw._build_command(wav, "en")
+    assert cmd[cmd.index("-l") + 1] == "en"
+    # other models keep auto
+    cmd = LocalWhisper(_cfg(tmp_path))._build_command(wav, "auto")
+    assert cmd[cmd.index("-l") + 1] == "auto"
+
+
+# ---------------------------------------------------------------- parakeet
+
+def _parakeet_cfg(tmp_path, files=True):
+    from vibeflow import parakeet
+    from vibeflow.config import ParakeetConfig
+
+    d = tmp_path / "pk"
+    d.mkdir()
+    if files:
+        for f in parakeet.PARAKEET_FILES:
+            (d / f.name).write_bytes(b"x")
+    return ParakeetConfig(model_dir=str(d))
+
+
+class _FakeSeg:
+    def __init__(self, text):
+        self.text = text
+
+
+def _install_fake_onnx_asr(monkeypatch, segments, calls=None, on_recognize=None):
+    import sys
+    import types
+
+    mod = types.ModuleType("onnx_asr")
+
+    class Adapter:
+        def with_vad(self, vad):
+            self.vad = vad
+            return self
+
+        def recognize(self, wav):
+            if calls is not None:
+                calls.append(("recognize", wav))
+            if on_recognize:
+                on_recognize()
+            return iter([_FakeSeg(t) for t in segments])
+
+    def load_model(name, path=None, quantization=None, **kw):
+        if calls is not None:
+            calls.append(("load_model", name, str(path), quantization))
+        return Adapter()
+
+    def load_vad(name="silero", path=None, **kw):
+        if calls is not None:
+            calls.append(("load_vad", name, str(path)))
+        return object()
+
+    mod.load_model = load_model
+    mod.load_vad = load_vad
+    monkeypatch.setitem(sys.modules, "onnx_asr", mod)
+
+
+def test_make_transcriber_parakeet_missing_files(tmp_path, monkeypatch):
+    _install_fake_onnx_asr(monkeypatch, [])
+    cfg = TranscriptionConfig(backend="parakeet", parakeet=_parakeet_cfg(tmp_path, files=False))
+    with pytest.raises(TranscriptionError, match="Parakeet model not found"):
+        make_transcriber(cfg)
+
+
+def test_make_transcriber_parakeet_no_onnx_asr(tmp_path, monkeypatch):
+    import sys
+
+    monkeypatch.setitem(sys.modules, "onnx_asr", None)  # makes `import onnx_asr` fail
+    cfg = TranscriptionConfig(backend="parakeet", parakeet=_parakeet_cfg(tmp_path))
+    with pytest.raises(TranscriptionError, match="onnx-asr is not available"):
+        make_transcriber(cfg)
+
+
+def test_parakeet_transcribe_joins_segments(tmp_path, monkeypatch):
+    calls = []
+    _install_fake_onnx_asr(monkeypatch, ["Dobar dan,", " svijete. [BLANK_AUDIO]", "Kako ste?"], calls)
+    cfg = TranscriptionConfig(backend="parakeet", parakeet=_parakeet_cfg(tmp_path))
+    t = make_transcriber(cfg)
+    wav = tmp_path / "a.wav"
+    assert t.transcribe(wav, "en") == "Dobar dan, svijete. Kako ste?"  # language is ignored
+    kinds = [c[0] for c in calls]
+    assert kinds[:2] == ["load_model", "load_vad"] and kinds[-1] == "recognize"
+    assert calls[0][1:] == ("nemo-parakeet-tdt-0.6b-v3", cfg.parakeet.model_dir, "int8")
+    assert calls[-1][1] == str(wav)
+
+
+def test_parakeet_cancel_drops_result(tmp_path, monkeypatch):
+    from vibeflow.transcribe import TranscriptionCancelled
+
+    holder = {}
+    _install_fake_onnx_asr(monkeypatch, ["hello"], on_recognize=lambda: holder["cancel"]())
+    cfg = TranscriptionConfig(backend="parakeet", parakeet=_parakeet_cfg(tmp_path))
+    t = make_transcriber(cfg)
+    holder["cancel"] = t.cancel
+    with pytest.raises(TranscriptionCancelled):
+        t.transcribe(tmp_path / "a.wav", "auto")
+    # the next call is not affected by the earlier cancel
+    holder["cancel"] = lambda: None
+    assert t.transcribe(tmp_path / "a.wav", "auto") == "hello"
+
+
+def test_parakeet_load_failure_is_readable(tmp_path, monkeypatch):
+    import sys
+    import types
+
+    mod = types.ModuleType("onnx_asr")
+
+    def boom(*a, **k):
+        raise RuntimeError("bad model")
+
+    mod.load_model = boom
+    mod.load_vad = boom
+    monkeypatch.setitem(sys.modules, "onnx_asr", mod)
+    cfg = TranscriptionConfig(backend="parakeet", parakeet=_parakeet_cfg(tmp_path))
+    t = make_transcriber(cfg)
+    with pytest.raises(TranscriptionError, match="bad model"):
+        t.transcribe(tmp_path / "a.wav", "auto")

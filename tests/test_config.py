@@ -165,3 +165,16 @@ def test_save_env_creates_file(monkeypatch, tmp_path):
     config.save_env({"LMSTUDIO_API_KEY": "k"}, p)
     assert p.read_text(encoding="utf-8") == "LMSTUDIO_API_KEY=k\n"
     monkeypatch.delenv("LMSTUDIO_API_KEY")
+
+
+def test_parakeet_section_round_trip(tmp_path):
+    c = Config()
+    c.transcription.backend = "parakeet"
+    c.transcription.parakeet.model_dir = "elsewhere/pk"
+    c.transcription.parakeet.threads = 4
+    assert config_from_dict(config_to_dict(c)) == c
+    p = tmp_path / "c.toml"
+    save_config(c, p)
+    assert "[transcription.parakeet]" in p.read_text(encoding="utf-8")
+    assert load_config(p) == c
+    assert Config().transcription.parakeet.model_dir == "whisper/models/parakeet-tdt-0.6b-v3"

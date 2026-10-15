@@ -99,6 +99,8 @@ class Tray:
             M(p.stem, act(self._pick_whisper, p), checked=chk(lambda p=p: model_selected(p)), radio=True)
             for p in models
         ]
+        trans_items.append(M("Parakeet v3 (local)", act(h.set_backend, "parakeet"),
+                             checked=chk(lambda: h.current_backend() == "parakeet"), radio=True))
         trans_items.append(M("Groq Whisper API", act(h.set_backend, "groq"),
                              checked=chk(lambda: h.current_backend() == "groq"), radio=True))
         trans_items.append(M("OpenAI Whisper API", act(h.set_backend, "openai"),
