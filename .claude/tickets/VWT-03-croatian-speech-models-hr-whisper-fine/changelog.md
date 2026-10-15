@@ -78,4 +78,4 @@ Repo: vibe-whisper-flow. Branch `VWT-03_croatian-asr-models`, cut from `origin/m
 - Parakeet adds about 60 MB of onnxruntime to the portable build. Its model is about 670 MB, downloaded
   separately.
 
-Commit status: uncommitted.
+Commit status: committed as f1f4343 on `VWT-03_croatian-asr-models` (not pushed).
