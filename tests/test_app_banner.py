@@ -1,15 +1,18 @@
 from types import SimpleNamespace
 
+from vibeflow import parakeet
 from vibeflow.app import DictationApp
 from vibeflow.config import Config
 
 
-def _app(error, tmp_path, exists):
+def _app(error, tmp_path, exists, backend="local"):
     cfg = Config()
-    model = tmp_path / "m.bin"
+    model = tmp_path / "ggml-m.bin"
     if exists:
         model.write_bytes(b"x")
     cfg.transcription.local.model = str(model)
+    cfg.transcription.parakeet.model_dir = str(tmp_path / "pk")
+    cfg.transcription.backend = backend
     app = DictationApp.__new__(DictationApp)
     app.cfg = cfg
     app._transcriber_error = error
@@ -21,7 +24,31 @@ def test_banner_none_when_ok(tmp_path):
 
 
 def test_banner_download_when_model_missing(tmp_path):
-    assert "Download a whisper model" in _app("boom", tmp_path, False)._settings_banner()
+    assert "Download a model" in _app("boom", tmp_path, False)._settings_banner()
+
+
+def _install_parakeet(tmp_path):
+    d = tmp_path / "pk"
+    d.mkdir()
+    for f in parakeet.PARAKEET_FILES:
+        (d / f.name).write_bytes(b"x")
+
+
+def test_banner_suggests_parakeet_when_only_parakeet_installed(tmp_path):
+    _install_parakeet(tmp_path)
+    banner = _app("boom", tmp_path, False)._settings_banner()
+    assert "No whisper model" in banner and "Parakeet" in banner
+
+
+def test_banner_other_whisper_model_installed(tmp_path):
+    (tmp_path / "ggml-small.bin").write_bytes(b"x")
+    assert "Pick another model" in _app("boom", tmp_path, False)._settings_banner()
+
+
+def test_banner_parakeet_backend_missing_model(tmp_path):
+    assert "Download the Parakeet model" in _app(
+        "boom", tmp_path, False, "parakeet")._settings_banner()
+    assert "switch the backend" in _app("boom", tmp_path, True, "parakeet")._settings_banner()
 
 
 def test_banner_error_text_otherwise(tmp_path):

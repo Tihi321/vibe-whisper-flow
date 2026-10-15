@@ -176,3 +176,67 @@ def test_parakeet_backend_accepted():
     form["backend"] = "local"
     with pytest.raises(ValueError):
         config_from_form(Config(), form)
+
+
+def _install_parakeet(d: Path) -> None:
+    d.mkdir(parents=True, exist_ok=True)
+    for f in settings_ui.parakeet.PARAKEET_FILES:
+        (d / f.name).write_bytes(b"x")
+
+
+@pytest.mark.parametrize("backend, whisper_present, expected", [
+    ("local", False, "parakeet"),   # no whisper model: switch to the new parakeet
+    ("parakeet", False, "parakeet"),  # already parakeet: re-apply to load the model
+    ("local", True, None),          # whisper works: leave it alone
+    ("groq", False, None),          # cloud backend: leave it alone
+])
+def test_parakeet_download_auto_selects(tmp_path, backend, whisper_present, expected):
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("no display")
+    root.withdraw()
+    cfg = Config()
+    cfg.transcription.backend = backend
+    cfg.transcription.parakeet.model_dir = str(tmp_path / "pk")
+    _install_parakeet(tmp_path / "pk")
+    if whisper_present:
+        (tmp_path / "ggml-small.bin").write_bytes(b"x")
+    applied: list = []
+    try:
+        win = SettingsWindow(root, _hooks(cfg, tmp_path, applied), lambda fn: fn())
+        win.show("transcription", "Download a model")
+        win._auto_select(settings_ui.parakeet.MODEL_NAME)
+        root.update()
+        if expected is None:
+            assert applied == []
+        else:
+            assert applied[-1][0].transcription.backend == expected
+            assert win._vars["backend"].get() == expected
+            assert win._banner.winfo_manager() == ""
+            assert not win._is_dirty()
+    finally:
+        root.destroy()
+
+
+def test_whisper_download_leaves_missing_parakeet(tmp_path):
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("no display")
+    root.withdraw()
+    cfg = Config()
+    cfg.transcription.backend = "parakeet"
+    cfg.transcription.parakeet.model_dir = str(tmp_path / "pk")  # not installed
+    applied: list = []
+    try:
+        win = SettingsWindow(root, _hooks(cfg, tmp_path, applied), lambda fn: fn())
+        win.show("transcription")
+        (tmp_path / "ggml-small.bin").write_bytes(b"x")
+        win._auto_select("small")
+        root.update()
+        t = applied[-1][0].transcription
+        assert t.backend == "local" and t.local.model.endswith("ggml-small.bin")
+        assert win._vars["backend"].get() == "local"
+    finally:
+        root.destroy()

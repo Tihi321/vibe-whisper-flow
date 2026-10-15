@@ -414,10 +414,28 @@ class DictationApp:
         """Banner for the settings window while the transcriber is unavailable."""
         if not self._transcriber_error:
             return None
-        missing = (self.cfg.transcription.backend == "local"
-                   and not resolve_path(self.cfg.transcription.local.model).exists())
-        return ("Download a whisper model below to start dictating" if missing
-                else self._transcriber_error)
+        from .parakeet import installed as parakeet_installed
+
+        t = self.cfg.transcription
+        try:
+            have_whisper = any(self._models_dir().glob("ggml-*.bin"))
+        except OSError:
+            have_whisper = False
+        have_parakeet = parakeet_installed(resolve_path(t.parakeet.model_dir))
+        if t.backend == "local" and not resolve_path(t.local.model).exists():
+            if have_whisper:
+                return "The selected whisper model is missing. Pick another model below"
+            if have_parakeet:
+                return ("No whisper model installed. Switch the backend to Local (Parakeet v3) "
+                        "or download a whisper model below")
+            return ("Download a model below to start dictating (whisper here, or pick "
+                    "Local (Parakeet v3) to download Parakeet)")
+        if t.backend == "parakeet" and not have_parakeet:
+            if have_whisper:
+                return ("Parakeet is not installed. Download it below or switch the backend to "
+                        "Local (whisper.cpp)")
+            return "Download the Parakeet model below to start dictating"
+        return self._transcriber_error
 
     def _open_settings_on_start(self) -> None:
         if self._transcriber_error:

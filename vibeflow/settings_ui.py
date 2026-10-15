@@ -685,27 +685,43 @@ class SettingsWindow:
                 messagebox.showerror("Download failed", str(err), parent=self.top)
             else:
                 self._set_status(f"Downloaded {name}.")
-                if not is_pk:
-                    self._auto_select(name)
+                self._auto_select(name)
         self._run_worker(f"Downloading {name}", work, done)
 
     def _auto_select(self, name: str) -> None:
-        """If the active model file is missing, switch to the freshly downloaded one and save."""
+        """If the saved backend has no usable model, switch to the freshly downloaded one and
+        save. The other local backend counts as unusable when its model is not installed."""
+        is_pk = name == parakeet.MODEL_NAME
         try:
-            if self.hooks.active_model_path().exists():
-                return
             base = self.hooks.get_config()
-            rel = portable_path(self.hooks.models_dir() / whisper_setup.model_filename(name))
-            base.transcription.local.model = rel
+            t = base.transcription
+            whisper_ok = self.hooks.active_model_path().exists()
+            parakeet_ok = parakeet.installed(resolve_path(t.parakeet.model_dir))
+            if is_pk:
+                # backend already parakeet: re-apply so the transcriber picks up the model
+                if not (t.backend == "parakeet" or (t.backend == "local" and not whisper_ok)):
+                    return
+                t.backend = "parakeet"
+            else:
+                if whisper_ok and not (t.backend == "parakeet" and not parakeet_ok):
+                    return
+                if not whisper_ok:
+                    fn = whisper_setup.model_filename(name)
+                    t.local.model = portable_path(self.hooks.models_dir() / fn)
+                if t.backend == "parakeet" and not parakeet_ok:
+                    t.backend = "local"
             err = self.hooks.apply(base, {})
         except Exception:
             log.exception("auto-select of downloaded model failed")
             return
-        fn = whisper_setup.model_filename(name)
-        self._vars["local_model"].set(fn)
-        self._snapshot["local_model"] = fn
+        if not is_pk:
+            fn = _basename(t.local.model)
+            self._vars["local_model"].set(fn)
+            self._snapshot["local_model"] = fn
+        self._vars["backend"].set(t.backend)
+        self._snapshot["backend"] = t.backend
         self._refresh_models()
-        self._set_banner(None)
+        self._set_banner(err)
         self._set_status(f"{name} selected and applied." if not err else f"Applied: {err}")
 
     def _delete_selected(self) -> None:
