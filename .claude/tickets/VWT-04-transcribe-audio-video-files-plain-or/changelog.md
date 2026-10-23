@@ -55,4 +55,4 @@ plain text (default), text with `[hh:mm:ss]` lines, SRT or VTT, with Copy and Sa
 - Plain format is one paragraph.
 - Cloud backends whose model doesn't return `verbose_json` segments (e.g. gpt-4o-transcribe) get coarse, chunk-level timestamps.
 
-**Commit status:** uncommitted.
+**Commit status:** committed as 79520af on `VWT-04_file-transcription` and pushed to origin (no PR yet).
