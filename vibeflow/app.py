@@ -444,6 +444,13 @@ class DictationApp:
             self.open_settings()
 
     # -- settings window
+    def _file_transcriber(self):
+        """Transcriber for a File-tab job: the shared Parakeet instance (one model in memory),
+        otherwise a private one so the job never touches dictation's process/cancel state."""
+        if self.cfg.transcription.backend == "parakeet" and self._transcriber is not None:
+            return self._transcriber
+        return self._transcribe.make_transcriber(self.cfg.transcription)
+
     def _settings_window(self):
         if self.settings is None:
             from .settings_ui import SettingsHooks, SettingsWindow
@@ -461,6 +468,7 @@ class DictationApp:
                 open_logs=self._open_logs,
                 open_config=self._open_config,
                 audio_devices=self._audio_devices,
+                file_transcriber=self._file_transcriber,
                 version=__version__,
             )
             self.settings = SettingsWindow(self.overlay.root, hooks, self.overlay.call_soon)

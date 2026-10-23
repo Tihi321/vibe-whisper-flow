@@ -80,7 +80,7 @@ def test_base_not_mutated():
     assert base == before
 
 
-def _hooks(cfg: Config, tmp_path: Path, applied: list) -> SettingsHooks:
+def _hooks(cfg: Config, tmp_path: Path, applied: list, file_transcriber=None) -> SettingsHooks:
     noop = lambda *a, **k: None  # noqa: E731
     return SettingsHooks(
         get_config=lambda: copy.deepcopy(cfg),
@@ -90,7 +90,8 @@ def _hooks(cfg: Config, tmp_path: Path, applied: list) -> SettingsHooks:
         is_autostart=lambda: False, set_autostart=noop, set_show_on_start=noop,
         whisper_dir=lambda: tmp_path, models_dir=lambda: tmp_path,
         active_model_path=lambda: tmp_path / "ggml-small.bin",
-        open_logs=noop, open_config=noop, audio_devices=lambda: ["Mic A"], version="0.0.0",
+        open_logs=noop, open_config=noop, audio_devices=lambda: ["Mic A"],
+        file_transcriber=file_transcriber or (lambda: None), version="0.0.0",
     )
 
 
@@ -238,5 +239,134 @@ def test_whisper_download_leaves_missing_parakeet(tmp_path):
         t = applied[-1][0].transcription
         assert t.backend == "local" and t.local.model.endswith("ggml-small.bin")
         assert win._vars["backend"].get() == "local"
+    finally:
+        root.destroy()
+
+
+class _Pump:
+    """Thread-safe `post` for tests: queue callbacks from workers, run them on the Tk thread."""
+
+    def __init__(self, root):
+        import queue
+
+        self.root, self.q = root, queue.Queue()
+
+    def post(self, fn):
+        self.q.put(fn)
+
+    def wait(self, win, timeout=10):
+        import queue
+        import time
+
+        deadline = time.time() + timeout
+        while win._file_busy and time.time() < deadline:
+            try:
+                self.q.get(timeout=0.02)()
+            except queue.Empty:
+                pass
+            self.root.update()
+        while not self.q.empty():
+            self.q.get()()
+
+
+def test_file_tab_does_not_dirty_and_runs(tmp_path, monkeypatch):
+    from vibeflow.transcribe import Segment
+
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("no display")
+    root.withdraw()
+
+    class Stub:
+        def transcribe_segments(self, wav, language, duration, progress, cancel):
+            progress(0.5)
+            return [Segment(0.0, 1.5, "Hello."), Segment(62.0, 64.0, "World.")]
+
+    monkeypatch.setattr(settings_ui.filetranscribe, "decode_to_wav",
+                        lambda src, dst, progress=None, cancel=None: 70.0)
+    cfg = Config()
+    cfg.transcription.language = "hr"
+    pump = _Pump(root)
+    try:
+        win = SettingsWindow(root, _hooks(cfg, tmp_path, [], file_transcriber=lambda: Stub()),
+                             pump.post)
+        win.show("file")
+        root.update()
+        assert "file" in settings_ui.TABS
+        assert win._file_lang.get() == "hr"  # initialised from the saved config
+        assert "Engine:" in win._file_engine.cget("text")
+
+        # editing File tab fields leaves the form clean
+        win._file_lang.set("de")
+        win._file_format.set(settings_ui.filetranscribe.FORMAT_LABELS["srt"])
+        assert not win._is_dirty()
+        assert not any(k.startswith("file") for k in win._collect())
+
+        # no file chosen: readable status, nothing runs
+        win._file_start()
+        assert "Choose" in win._file_status_var.get() and not win._file_busy
+
+        src = tmp_path / "talk.mp3"
+        src.write_bytes(b"x")
+        win._file_src = src
+        win._file_path.set(str(src))
+        win._file_format.set(settings_ui.filetranscribe.FORMAT_LABELS["plain"])
+        win._file_start()
+        assert win._file_busy
+        pump.wait(win)
+        assert not win._file_busy
+        assert win._file_text.get("1.0", "end-1c") == "Hello. World."
+        assert win._file_status_var.get().startswith("Done: 1:04 of audio")
+
+        # re-render on format change without re-running
+        win._file_format.set(settings_ui.filetranscribe.FORMAT_LABELS["timestamps"])
+        win._file_format_combo.event_generate("<<ComboboxSelected>>")
+        root.update()
+        assert win._file_text.get("1.0", "end-1c") == "[00:00:00] Hello.\n[00:01:02] World."
+
+        # reopening Settings (populate) keeps the result and stays clean
+        win.show("file")
+        root.update()
+        assert win._file_text.get("1.0", "end-1c").startswith("[00:00:00]")
+        assert not win._is_dirty()
+
+        # saving a different backend refreshes the engine line
+        assert "whisper.cpp" in win._file_engine.cget("text")
+        win._vars["backend"].set("groq")
+        assert win.save()
+        assert "Groq API" in win._file_engine.cget("text")
+    finally:
+        root.destroy()
+
+
+def test_file_tab_error_and_cancel(tmp_path, monkeypatch):
+    from vibeflow.transcribe import TranscriptionCancelled, TranscriptionError
+
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("no display")
+    root.withdraw()
+    src = tmp_path / "a.mp3"
+    src.write_bytes(b"x")
+    outcome = {"exc": TranscriptionError("model missing")}
+    pump = _Pump(root)
+
+    def failing():
+        raise outcome["exc"]
+
+    try:
+        win = SettingsWindow(root, _hooks(Config(), tmp_path, [], file_transcriber=failing),
+                             pump.post)
+        win.show("file")
+        win._file_src = src
+        for exc, text in ((TranscriptionError("model missing"), "Failed: model missing"),
+                          (TranscriptionCancelled("cancelled"), "Cancelled.")):
+            outcome["exc"] = exc
+            win._file_start()
+            pump.wait(win)
+            assert win._file_status_var.get() == text
+            assert not win._file_segments
     finally:
         root.destroy()

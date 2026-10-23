@@ -7,16 +7,18 @@ import logging
 import os
 import sys
 import threading
+import time
 import tkinter as tk
 from dataclasses import dataclass
 from pathlib import Path
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 from typing import Any, Callable
 
-from . import parakeet, whisper_setup
+from . import filetranscribe, parakeet, whisper_setup
 from .cleanup import DEFAULT_PROMPT
 from .config import ROOT, Config, portable_path, resolve_path
 from .hotkeys import parse_chord
+from .transcribe import Segment, TranscriptionCancelled, TranscriptionError
 
 try:  # optional: UI still works (with the stock ttk theme) without it
     import sv_ttk
@@ -25,9 +27,9 @@ except ImportError:  # pragma: no cover
 
 log = logging.getLogger(__name__)
 
-TABS = ("general", "transcription", "cleanup", "keys", "about")
-TAB_TITLES = {"general": "General", "transcription": "Transcription", "cleanup": "Cleanup",
-              "keys": "API keys", "about": "About"}
+TABS = ("general", "transcription", "file", "cleanup", "keys", "about")
+TAB_TITLES = {"general": "General", "transcription": "Transcription", "file": "File",
+              "cleanup": "Cleanup", "keys": "API keys", "about": "About"}
 BACKENDS = ("local", "parakeet", "groq", "openai")
 PROVIDERS = ("lmstudio", "groq", "openai", "anthropic", "none")
 LANGUAGES = ("auto", "en", "hr", "de", "fr", "es", "it", "pt", "nl", "pl", "ru", "uk", "ja", "zh")
@@ -176,6 +178,7 @@ class SettingsHooks:
     open_logs: Callable[[], None]
     open_config: Callable[[], None]
     audio_devices: Callable[[], list[str]]
+    file_transcriber: Callable[[], Any]
     version: str = ""
 
 
@@ -192,6 +195,18 @@ def _windows_dark() -> bool:
             return winreg.QueryValueEx(k, "AppsUseLightTheme")[0] == 0
     except Exception:
         return False
+
+
+def _fmt_clock(seconds: float) -> str:
+    s = int(round(seconds))
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
+
+
+def _fmt_elapsed(seconds: float) -> str:
+    s = int(round(seconds))
+    return f"{s // 60}m {s % 60:02d}s" if s >= 60 else f"{s}s"
 
 
 def _fmt_size(n: int) -> str:
@@ -223,6 +238,12 @@ class SettingsWindow:
         self._busy = False
         self._cancel = threading.Event()
         self._closed = False
+        # File tab state: deliberately outside self._vars so it never feeds _collect/_is_dirty/Save.
+        self._file_busy = False
+        self._file_cancel = threading.Event()
+        self._file_segments: list[Segment] = []
+        self._file_src: Path | None = None
+        self._file_lang_init = False
 
     # -- public -----------------------------------------------------------
     def is_visible(self) -> bool:
@@ -353,6 +374,7 @@ class SettingsWindow:
             frames[name] = f
         self._build_general(frames["general"])
         self._build_transcription(frames["transcription"])
+        self._build_file(frames["file"])
         self._build_cleanup(frames["cleanup"])
         self._build_keys(frames["keys"])
         self._build_about(frames["about"])
@@ -792,6 +814,207 @@ class SettingsWindow:
                 self._refresh_models()
         self._run_worker(label, work, done)
 
+    # -- File ---------------------------------------------------------------------
+    def _build_file(self, f: ttk.Frame) -> None:
+        self._file_path = tk.StringVar(value="")
+        self._file_format = tk.StringVar(value=filetranscribe.FORMAT_LABELS["plain"])
+        self._file_lang = tk.StringVar(value="auto")
+        self._file_status_var = tk.StringVar(value="")
+
+        top = ttk.Frame(f)
+        top.pack(fill="x")
+        top.columnconfigure(1, weight=1)
+        ttk.Label(top, text="File").grid(row=0, column=0, sticky="w", pady=3, padx=(0, 10))
+        ttk.Entry(top, textvariable=self._file_path, state="readonly").grid(
+            row=0, column=1, sticky="ew", pady=3)
+        self._file_browse_btn = ttk.Button(top, text="Browse...", command=self._file_browse)
+        self._file_browse_btn.grid(row=0, column=2, padx=(8, 0))
+        ttk.Label(top, text="Format").grid(row=1, column=0, sticky="w", pady=3, padx=(0, 10))
+        self._file_format_combo = ttk.Combobox(
+            top, textvariable=self._file_format, state="readonly", width=24,
+            values=[filetranscribe.FORMAT_LABELS[k] for k in filetranscribe.FORMATS])
+        self._file_format_combo.grid(row=1, column=1, sticky="w", pady=3)
+        self._file_format_combo.bind("<<ComboboxSelected>>", lambda _e: self._file_render())
+        ttk.Label(top, text="Language").grid(row=2, column=0, sticky="w", pady=3, padx=(0, 10))
+        self._file_lang_combo = ttk.Combobox(top, textvariable=self._file_lang, values=list(LANGUAGES),
+                                             state="normal", width=10)
+        self._file_lang_combo.grid(row=2, column=1, sticky="w", pady=3)
+        self._file_engine = ttk.Label(f, text="", foreground="gray", wraplength=620, justify="left")
+        self._file_engine.pack(anchor="w", pady=(6, 0))
+
+        run = ttk.Frame(f)
+        run.pack(fill="x", pady=(8, 0))
+        self._file_run_btn = ttk.Button(
+            run, text="Transcribe", style="Accent.TButton" if sv_ttk else "TButton",
+            command=self._file_start)
+        self._file_run_btn.pack(side="left")
+        self._file_cancel_btn = ttk.Button(run, text="Cancel", command=self._file_cancel.set,
+                                           state="disabled")
+        self._file_cancel_btn.pack(side="left", padx=6)
+        self._file_bar = ttk.Progressbar(run, mode="determinate", length=200, maximum=100)
+        self._file_bar.pack(side="left", padx=(8, 0))
+        ttk.Label(f, textvariable=self._file_status_var, wraplength=620, justify="left").pack(
+            anchor="w", pady=(4, 0))
+
+        rf = ttk.LabelFrame(f, text="Result", padding=8)
+        rf.pack(fill="both", expand=True, pady=(8, 0))
+        self._file_text = tk.Text(rf, height=10, wrap="word", font=("Segoe UI", 9))
+        sb = ttk.Scrollbar(rf, orient="vertical", command=self._file_text.yview)
+        self._file_text.configure(yscrollcommand=sb.set)
+        self._file_text.grid(row=0, column=0, sticky="nsew")
+        sb.grid(row=0, column=1, sticky="ns")
+        rf.columnconfigure(0, weight=1)
+        rf.rowconfigure(0, weight=1)
+        btns = ttk.Frame(rf)
+        btns.grid(row=1, column=0, columnspan=2, sticky="e", pady=(6, 0))
+        self._file_copy_btn = ttk.Button(btns, text="Copy", command=self._file_copy, state="disabled")
+        self._file_copy_btn.pack(side="left")
+        self._file_save_btn = ttk.Button(btns, text="Save as...", command=self._file_save,
+                                         state="disabled")
+        self._file_save_btn.pack(side="left", padx=(6, 0))
+
+    def _file_fmt(self) -> str:
+        label = self._file_format.get()
+        for key, text in filetranscribe.FORMAT_LABELS.items():
+            if text == label:
+                return key
+        return "plain"
+
+    def _file_set_status(self, text: str) -> None:
+        try:
+            self._file_status_var.set(text)
+        except tk.TclError:
+            pass
+
+    def _file_browse(self) -> None:
+        if self._file_busy:
+            return
+        start = self._file_src.parent if self._file_src else None
+        path = filedialog.askopenfilename(
+            parent=self.top, title="Choose an audio or video file",
+            initialdir=str(start) if start else None,
+            filetypes=[("Audio and video", filetranscribe.MEDIA_PATTERNS), ("All files", "*.*")])
+        if path:
+            self._file_src = Path(path)
+            self._file_path.set(path)
+
+    def _file_render(self) -> None:
+        text = filetranscribe.render(self._file_segments, self._file_fmt()) if self._file_segments else ""
+        self._file_text.delete("1.0", "end")
+        self._file_text.insert("1.0", text)
+        state = "normal" if self._file_segments else "disabled"
+        self._file_copy_btn.configure(state=state)
+        self._file_save_btn.configure(state=state)
+
+    def _file_copy(self) -> None:
+        text = self._file_text.get("1.0", "end-1c")
+        if not text:
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.root.update()  # keep the clipboard contents after the window closes
+        self._file_set_status("Copied to the clipboard.")
+
+    def _file_save(self) -> None:
+        if not self._file_segments:
+            return
+        fmt = self._file_fmt()
+        ext = filetranscribe.FORMAT_EXT[fmt]
+        stem = self._file_src.stem if self._file_src else "transcript"
+        path = filedialog.asksaveasfilename(
+            parent=self.top, title="Save transcript", defaultextension=ext,
+            initialdir=str(self._file_src.parent) if self._file_src else None,
+            initialfile=f"{stem}{ext}",
+            filetypes=[(filetranscribe.FORMAT_LABELS[fmt], f"*{ext}"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            Path(path).write_text(filetranscribe.render(self._file_segments, fmt),
+                                  encoding="utf-8", newline="\n")
+        except OSError as e:
+            messagebox.showerror("Save failed", str(e), parent=self.top)
+            return
+        self._file_set_status(f"Saved {path}")
+
+    def _file_set_busy(self, busy: bool) -> None:
+        self._file_busy = busy
+        self._file_run_btn.configure(state="disabled" if busy else "normal")
+        self._file_browse_btn.configure(state="disabled" if busy else "normal")
+        self._file_cancel_btn.configure(state="normal" if busy else "disabled")
+        if not busy:
+            self._file_bar.configure(value=0)
+
+    def _file_start(self) -> None:
+        if self._file_busy:
+            return
+        src = self._file_src
+        if src is None or not src.is_file():
+            self._file_set_status("Choose an audio or video file first.")
+            return
+        language = self._file_lang.get().strip() or "auto"
+        self._file_cancel.clear()
+        cancel = self._file_cancel
+        self._file_set_busy(True)
+        self._file_set_status("Starting...")
+        started = time.monotonic()
+        last = {"stage": "", "pct": -1}
+
+        def progress(stage: str, frac: float | None) -> None:
+            pct = -1 if frac is None else int(max(0.0, min(frac, 1.0)) * 100)
+            if stage == last["stage"] and pct == last["pct"]:
+                return
+            last["stage"], last["pct"] = stage, pct
+
+            def ui() -> None:
+                self._file_bar.configure(value=max(pct, 0))
+                self._file_set_status(f"{stage}... {pct}%" if pct >= 0 else f"{stage}...")
+            self._post(lambda: self._safe_ui(ui))
+
+        def run() -> None:
+            segments: list[Segment] = []
+            error: Exception | None = None
+            try:
+                transcriber = self.hooks.file_transcriber()
+                segments = filetranscribe.transcribe_file(src, transcriber, language, progress, cancel)
+            except Exception as e:  # noqa: BLE001
+                if not isinstance(e, TranscriptionError):  # TranscriptionCancelled is a subclass
+                    log.exception("file transcription failed")
+                error = e
+            elapsed = time.monotonic() - started
+
+            def finish() -> None:
+                self._file_set_busy(False)
+                if isinstance(error, TranscriptionCancelled):
+                    self._file_set_status("Cancelled.")
+                elif error is not None:
+                    self._file_set_status(f"Failed: {error}")
+                else:
+                    self._file_segments = segments
+                    self._file_render()
+                    if not segments:
+                        self._file_set_status("Done, but no speech was found.")
+                    else:
+                        audio = _fmt_clock(segments[-1].end)
+                        self._file_set_status(f"Done: {audio} of audio in {_fmt_elapsed(elapsed)}")
+            self._post(lambda: self._safe_ui(finish))
+
+        threading.Thread(target=run, name="vibeflow-file-transcribe", daemon=True).start()
+
+    def _file_refresh_engine(self, cfg: Config) -> None:
+        t = cfg.transcription
+        if t.backend == "local":
+            text = f"Local (whisper.cpp), {_basename(t.local.model)}"
+        elif t.backend == "parakeet":
+            text = "Local (Parakeet v3)"
+        elif t.backend == "groq":
+            text = f"Groq API, {t.cloud.groq_model}"
+        elif t.backend == "openai":
+            text = f"OpenAI API, {t.cloud.openai_model}"
+        else:
+            text = t.backend
+        self._file_engine.configure(
+            text=f"Engine: {text}. Change it on the Transcription tab (save first).")
+
     # -- Cleanup ---------------------------------------------------------------
     def _build_cleanup(self, f: ttk.Frame) -> None:
         top = ttk.Frame(f)
@@ -955,6 +1178,10 @@ class SettingsWindow:
         except Exception:
             pass
         self._refresh_models()
+        self._file_refresh_engine(cfg)
+        if not self._file_lang_init:  # initial language only; the File tab never persists it
+            self._file_lang.set(cfg.transcription.language or "auto")
+            self._file_lang_init = True
         self._check_chord()
         self._set_status("")
 
@@ -1027,6 +1254,7 @@ class SettingsWindow:
         self._env_snapshot.update({k: v for k, v in
                                    ((k, var.get().strip()) for k, var in self._env_vars.items())})
         self._refresh_models()
+        self._file_refresh_engine(cfg)
         if err:
             self._set_status(f"Saved, but: {err}")
             messagebox.showwarning("VibeFlow", err, parent=self.top)

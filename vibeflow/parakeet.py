@@ -12,7 +12,13 @@ from typing import Any, NamedTuple
 
 from . import whisper_setup
 from .config import ParakeetConfig, resolve_path
-from .transcribe import TranscriptionCancelled, TranscriptionError, _clean_output
+from .transcribe import (
+    ProgressFn,
+    Segment,
+    TranscriptionCancelled,
+    TranscriptionError,
+    _clean_output,
+)
 
 log = logging.getLogger(__name__)
 
@@ -178,3 +184,35 @@ class ParakeetTranscriber:
             if self._cancelled:  # inference can't be interrupted; drop the result
                 raise TranscriptionCancelled("cancelled")
             return _clean_output(text)
+
+    def transcribe_segments(self, wav: Path, language: str, duration: float,
+                            progress: ProgressFn, cancel: threading.Event) -> list[Segment]:
+        """Timestamped segments for a file job. Shares the model with dictation, so the lock is
+        held per VAD segment only, and self._cancelled (dictation's) is never touched."""
+        ok, reason = self.available()
+        if not ok:
+            raise TranscriptionError(reason)
+        self._ready.wait()
+        if self._model is None:
+            raise TranscriptionError(self._load_error or "Parakeet model is not loaded")
+        out: list[Segment] = []
+        try:
+            with self._lock:
+                it = iter(self._model.recognize(str(Path(wav))))
+            while True:
+                if cancel.is_set():
+                    raise TranscriptionCancelled("cancelled")
+                with self._lock:
+                    seg = next(it, None)
+                if seg is None:
+                    break
+                text = _clean_output(seg.text)
+                if text:
+                    out.append(Segment(float(seg.start), float(seg.end), text))
+                if duration > 0:
+                    progress(min(float(seg.end) / duration, 1.0))
+        except TranscriptionError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise TranscriptionError(f"Parakeet transcription failed: {exc}") from exc
+        return out

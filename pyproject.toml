@@ -15,6 +15,7 @@ dependencies = [
     "Pillow",
     "pywin32",
     "requests",
+    "av",
     "onnx-asr[cpu]",
     "tomli-w",
     "sv-ttk",
