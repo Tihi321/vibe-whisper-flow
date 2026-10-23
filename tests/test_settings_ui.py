@@ -370,3 +370,50 @@ def test_file_tab_error_and_cancel(tmp_path, monkeypatch):
             assert not win._file_segments
     finally:
         root.destroy()
+
+
+def test_file_tab_lrc_batch_writes_next_to_sources(tmp_path, monkeypatch):
+    from vibeflow.transcribe import Segment, TranscriptionError
+
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("no display")
+    root.withdraw()
+
+    class Stub:
+        def transcribe_segments(self, wav, language, duration, progress, cancel):
+            return [Segment(0.0, 1.5, "Hello."), Segment(10.0, 12.0, "World.")]
+
+    def fake_decode(src, dst, progress=None, cancel=None):
+        if src.name == "bad.mp3":
+            raise TranscriptionError("broken file")
+        return 12.0
+
+    monkeypatch.setattr(settings_ui.filetranscribe, "decode_to_wav", fake_decode)
+    songs = []
+    for name in ("one.mp3", "bad.mp3", "three.mp3"):
+        p = tmp_path / name
+        p.write_bytes(b"x")
+        songs.append(p)
+    pump = _Pump(root)
+    try:
+        win = SettingsWindow(root, _hooks(Config(), tmp_path, [], file_transcriber=lambda: Stub()),
+                             pump.post)
+        win.show("file")
+        root.update()
+        win._file_format.set(settings_ui.filetranscribe.FORMAT_LABELS["lrc"])
+        win._file_format_combo.event_generate("<<ComboboxSelected>>")
+        root.update()
+        assert win._file_beside.get()  # on by default for LRC
+        win._file_srcs = songs
+        win._file_src = songs[0]
+        win._file_start()
+        pump.wait(win)
+        assert (tmp_path / "one.lrc").read_text(encoding="utf-8").startswith("[ti:one]")
+        assert (tmp_path / "three.lrc").is_file()
+        assert not (tmp_path / "bad.lrc").exists()  # one failure does not stop the batch
+        status = win._file_status_var.get()
+        assert status.startswith("Wrote 2 of 3") and "bad.mp3: broken file" in status
+    finally:
+        root.destroy()

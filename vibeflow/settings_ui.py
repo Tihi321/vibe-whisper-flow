@@ -243,6 +243,8 @@ class SettingsWindow:
         self._file_cancel = threading.Event()
         self._file_segments: list[Segment] = []
         self._file_src: Path | None = None
+        self._file_srcs: list[Path] = []
+        self._file_meta: dict | None = None  # tags + length of the single-file result, for LRC
         self._file_lang_init = False
 
     # -- public -----------------------------------------------------------
@@ -820,6 +822,7 @@ class SettingsWindow:
         self._file_format = tk.StringVar(value=filetranscribe.FORMAT_LABELS["plain"])
         self._file_lang = tk.StringVar(value="auto")
         self._file_status_var = tk.StringVar(value="")
+        self._file_beside = tk.BooleanVar(value=False)
 
         top = ttk.Frame(f)
         top.pack(fill="x")
@@ -834,13 +837,19 @@ class SettingsWindow:
             top, textvariable=self._file_format, state="readonly", width=24,
             values=[filetranscribe.FORMAT_LABELS[k] for k in filetranscribe.FORMATS])
         self._file_format_combo.grid(row=1, column=1, sticky="w", pady=3)
-        self._file_format_combo.bind("<<ComboboxSelected>>", lambda _e: self._file_render())
+        self._file_format_combo.bind("<<ComboboxSelected>>", self._file_format_changed)
         ttk.Label(top, text="Language").grid(row=2, column=0, sticky="w", pady=3, padx=(0, 10))
         self._file_lang_combo = ttk.Combobox(top, textvariable=self._file_lang, values=list(LANGUAGES),
                                              state="normal", width=10)
         self._file_lang_combo.grid(row=2, column=1, sticky="w", pady=3)
+        ttk.Checkbutton(top, text="Save next to each source file", variable=self._file_beside).grid(
+            row=3, column=1, sticky="w", pady=3)
         self._file_engine = ttk.Label(f, text="", foreground="gray", wraplength=620, justify="left")
         self._file_engine.pack(anchor="w", pady=(6, 0))
+        self._file_hint = ttk.Label(
+            f, foreground="gray", wraplength=620, justify="left",
+            text="Croatian songs: large-v3-turbo-hr. Mixed languages: Parakeet v3. "
+                 "Check the draft before importing into Spodrive.")
 
         run = ttk.Frame(f)
         run.pack(fill="x", pady=(8, 0))
@@ -890,16 +899,34 @@ class SettingsWindow:
         if self._file_busy:
             return
         start = self._file_src.parent if self._file_src else None
-        path = filedialog.askopenfilename(
-            parent=self.top, title="Choose an audio or video file",
+        paths = filedialog.askopenfilenames(
+            parent=self.top, title="Choose audio or video files",
             initialdir=str(start) if start else None,
             filetypes=[("Audio and video", filetranscribe.MEDIA_PATTERNS), ("All files", "*.*")])
-        if path:
-            self._file_src = Path(path)
-            self._file_path.set(path)
+        if paths:
+            self._file_srcs = [Path(p) for p in paths]
+            self._file_src = self._file_srcs[0]
+            self._file_path.set(str(self._file_src) if len(paths) == 1
+                                else f"{len(paths)} files: {self._file_src.name}, ...")
+
+    def _file_format_changed(self, _event=None) -> None:
+        # LRC is meant for batches of songs: show the model hint and default to saving beside the sources
+        lrc = self._file_fmt() == "lrc"
+        if lrc:
+            self._file_hint.pack(anchor="w", pady=(2, 0), after=self._file_engine)
+        else:
+            self._file_hint.pack_forget()
+        self._file_beside.set(lrc)
+        self._file_render()
+
+    def _file_sources(self) -> list[Path]:
+        if len(self._file_srcs) > 1:
+            return list(self._file_srcs)
+        return [self._file_src] if self._file_src else []
 
     def _file_render(self) -> None:
-        text = filetranscribe.render(self._file_segments, self._file_fmt()) if self._file_segments else ""
+        text = (filetranscribe.render(self._file_segments, self._file_fmt(), self._file_meta)
+                if self._file_segments else "")
         self._file_text.delete("1.0", "end")
         self._file_text.insert("1.0", text)
         state = "normal" if self._file_segments else "disabled"
@@ -929,7 +956,7 @@ class SettingsWindow:
         if not path:
             return
         try:
-            Path(path).write_text(filetranscribe.render(self._file_segments, fmt),
+            Path(path).write_text(filetranscribe.render(self._file_segments, fmt, self._file_meta),
                                   encoding="utf-8", newline="\n")
         except OSError as e:
             messagebox.showerror("Save failed", str(e), parent=self.top)
@@ -947,35 +974,66 @@ class SettingsWindow:
     def _file_start(self) -> None:
         if self._file_busy:
             return
-        src = self._file_src
-        if src is None or not src.is_file():
+        srcs = self._file_sources()
+        if not srcs or not all(p.is_file() for p in srcs):
             self._file_set_status("Choose an audio or video file first.")
             return
+        fmt = self._file_fmt()
+        batch = len(srcs) > 1 or self._file_beside.get()  # batch: write <stem><ext> beside each source
         language = self._file_lang.get().strip() or "auto"
         self._file_cancel.clear()
         cancel = self._file_cancel
         self._file_set_busy(True)
         self._file_set_status("Starting...")
         started = time.monotonic()
-        last = {"stage": "", "pct": -1}
+        last = {"stage": "", "pct": -1, "k": 0}
+        current = {"k": 1}
 
         def progress(stage: str, frac: float | None) -> None:
             pct = -1 if frac is None else int(max(0.0, min(frac, 1.0)) * 100)
-            if stage == last["stage"] and pct == last["pct"]:
+            k = current["k"]
+            if stage == last["stage"] and pct == last["pct"] and k == last["k"]:
                 return
-            last["stage"], last["pct"] = stage, pct
+            last["stage"], last["pct"], last["k"] = stage, pct, k
+            prefix = f"File {k} of {len(srcs)}: {srcs[k - 1].name} \u2014 " if batch else ""
 
             def ui() -> None:
                 self._file_bar.configure(value=max(pct, 0))
-                self._file_set_status(f"{stage}... {pct}%" if pct >= 0 else f"{stage}...")
+                self._file_set_status(f"{prefix}{stage}... {pct}%" if pct >= 0 else f"{prefix}{stage}...")
             self._post(lambda: self._safe_ui(ui))
 
         def run() -> None:
             segments: list[Segment] = []
+            meta: dict | None = None
             error: Exception | None = None
+            written = 0
+            failed: list[str] = []
             try:
                 transcriber = self.hooks.file_transcriber()
-                segments = filetranscribe.transcribe_file(src, transcriber, language, progress, cancel)
+                for k, src in enumerate(srcs, 1):
+                    current["k"] = k
+                    try:
+                        segments = filetranscribe.transcribe_file(src, transcriber, language,
+                                                                  progress, cancel)
+                        meta = filetranscribe.read_tags(src)
+                        if not meta.get("length") and segments:
+                            meta["length"] = segments[-1].end  # tags gave no duration
+                        if not batch:
+                            break
+                        if not segments:
+                            failed.append(f"{src.name}: no speech found")
+                            continue
+                        filetranscribe.output_path(src, fmt).write_text(
+                            filetranscribe.render(segments, fmt, meta), encoding="utf-8", newline="\n")
+                        written += 1
+                    except TranscriptionCancelled:
+                        raise
+                    except Exception as e:  # noqa: BLE001
+                        if not batch:
+                            raise
+                        if not isinstance(e, (TranscriptionError, OSError)):
+                            log.exception("file transcription failed")
+                        failed.append(f"{src.name}: {e}")  # report it and carry on with the next file
             except Exception as e:  # noqa: BLE001
                 if not isinstance(e, TranscriptionError):  # TranscriptionCancelled is a subclass
                     log.exception("file transcription failed")
@@ -984,12 +1042,22 @@ class SettingsWindow:
 
             def finish() -> None:
                 self._file_set_busy(False)
-                if isinstance(error, TranscriptionCancelled):
+                if batch:
+                    msg = f"Wrote {written} of {len(srcs)} file(s) next to the sources"
+                    if failed:
+                        msg += f"; failed: {'; '.join(failed)}"
+                    if isinstance(error, TranscriptionCancelled):
+                        msg = f"Cancelled. {msg}"
+                    elif error is not None:
+                        msg = f"Failed: {error}. {msg}"
+                    self._file_set_status(msg)
+                elif isinstance(error, TranscriptionCancelled):
                     self._file_set_status("Cancelled.")
                 elif error is not None:
                     self._file_set_status(f"Failed: {error}")
                 else:
                     self._file_segments = segments
+                    self._file_meta = meta
                     self._file_render()
                     if not segments:
                         self._file_set_status("Done, but no speech was found.")
