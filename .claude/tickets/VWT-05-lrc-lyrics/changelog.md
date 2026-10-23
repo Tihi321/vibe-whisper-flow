@@ -19,4 +19,4 @@ Branch `VWT-05_lrc-lyrics` (from `origin/master`).
 
 **Verification:** `.venv\Scripts\python.exe -m pytest tests -q` gives 243 passed. Not run: a GUI batch with real songs, Cancel pressed mid-batch, and importing the output into Spodrive.
 
-**Status:** uncommitted.
+**Status:** committed and pushed as `4653e48` on `VWT-05_lrc-lyrics`. No PR opened yet.
