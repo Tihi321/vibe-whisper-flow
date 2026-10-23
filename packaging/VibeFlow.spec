@@ -15,6 +15,7 @@ datas += collect_data_files("onnx_asr")  # preprocessor graphs
 # frozen app fails with PackageNotFoundError.
 datas += copy_metadata("onnx-asr") + copy_metadata("onnxruntime")
 binaries = collect_dynamic_libs("onnxruntime")  # Parakeet backend (onnx-asr)
+binaries += collect_dynamic_libs("av")  # FFmpeg DLLs for decoding audio/video files
 
 hiddenimports = [
     "pynput.keyboard._win32",
@@ -24,6 +25,8 @@ hiddenimports = [
     "vibeflow.settings_ui",
     "vibeflow.whisper_setup",
     "vibeflow.parakeet",
+    "vibeflow.filetranscribe",
+    "av",
     "onnx_asr",
     "vibeflow.single_instance",
 ]

@@ -7,6 +7,7 @@ Wispr-Flow-style dictation for Windows. Hold a hotkey, speak, release: the trans
 - Push-to-talk (hold) and hands-free (double-tap) dictation, system-wide
 - Local transcription with whisper.cpp (small / medium models), or Groq / OpenAI Whisper API
 - Optional LLM cleanup of fillers, punctuation and casing: LM Studio (default), Groq, OpenAI, Anthropic
+- Transcribe existing audio/video files (mp3, m4a, mp4, mkv, ...) to plain text, timestamped text, SRT or VTT
 - Tiny floating status pill that never steals focus
 - Tray icon: enable/disable, pick whisper model, pick cleanup model, launch at login
 - Settings window (tray left-click) for everything: hotkey, models, API keys, cleanup, output
@@ -54,13 +55,23 @@ A microphone icon appears in the tray. Left-click it to open the Settings window
 
 ## Settings window
 
-Open it with a left-click on the tray icon or **Settings...** in the tray menu. Tabs: **General**, **Transcription**, **Cleanup**, **API keys**, **About**.
+Open it with a left-click on the tray icon or **Settings...** in the tray menu. Tabs: **General**, **Transcription**, **File**, **Cleanup**, **API keys**, **About**.
 
 - Closing the window with **X** only hides it to the tray; **Quit** is available from the tray menu only.
 - The **Show this window when VibeFlow starts** checkbox is saved immediately. Uncheck it to start silently in the tray.
 - Launching VibeFlow again while it is already running brings the window up instead of starting a second copy.
 - Launch at login starts VibeFlow hidden (`--hidden`).
 - The Transcription tab downloads whisper models and the whisper engine (CPU or CUDA). API keys are written to `.env`.
+
+## Transcribe a file
+
+Open **Settings > File**, click **Browse...** and pick an audio or video file (mp3, wav, m4a, aac, flac, ogg, opus, wma, mp4, mkv, mov, avi, webm). Choose a format and click **Transcribe**:
+
+- **Plain text**, **Text with timestamps** (`[hh:mm:ss]` per line), **SRT subtitles** or **VTT subtitles**. Switching the format re-renders the finished result without transcribing again.
+- The engine is the backend saved on the **Transcription** tab (whisper.cpp, Parakeet, Groq or OpenAI). The language box is for this job only and is not saved.
+- Audio is decoded locally with PyAV (FFmpeg is bundled), so no extra install is needed. LLM cleanup is not applied to file transcripts.
+- Use **Copy** or **Save as...** for the result; nothing is saved automatically. **Cancel** stops a running job.
+- Groq and OpenAI accept at most 25 MB per upload, so long files are split into chunks of up to 10 minutes and the timestamps are joined back together. Some models (for example `gpt-4o-transcribe`) return no timestamps; those files get one timestamp per chunk.
 
 ## Portable build (exe)
 
@@ -196,6 +207,7 @@ vibeflow/
   hotkeys.py             global hotkey listener, chord parsing
   audio.py               microphone recording
   transcribe.py          whisper.cpp / Groq / OpenAI
+  filetranscribe.py      audio/video file decoding (PyAV) and text/SRT/VTT output
   cleanup.py             LLM cleanup (LM Studio, Groq, OpenAI, Anthropic)
   inject.py              clipboard + paste / type
   overlay.py             status pill (tkinter)

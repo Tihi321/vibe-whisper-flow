@@ -229,3 +229,204 @@ def test_parakeet_load_failure_is_readable(tmp_path, monkeypatch):
     t = make_transcriber(cfg)
     with pytest.raises(TranscriptionError, match="bad model"):
         t.transcribe(tmp_path / "a.wav", "auto")
+
+
+# ---------------------------------------------------------------- segments (file transcription)
+
+def test_build_command_segments(tmp_path):
+    cmd = LocalWhisper(_cfg(tmp_path))._build_command(tmp_path / "a.wav", "en", segments=True)
+    assert "-oj" in cmd and "-pp" in cmd
+    for flag in ("-nt", "-np", "-otxt"):
+        assert flag not in cmd
+    assert cmd[cmd.index("-of") + 1] == str(tmp_path / "a")
+    assert cmd[cmd.index("-l") + 1] == "en"
+
+
+def test_segments_from_whisper_json():
+    from vibeflow.transcribe import Segment, _segments_from_whisper_json
+
+    data = {"transcription": [
+        {"offsets": {"from": 0, "to": 2500}, "text": " Hello there."},
+        {"offsets": {"from": 2500, "to": 3000}, "text": " [BLANK_AUDIO]"},
+        {"offsets": {"from": 3000, "to": 61_250}, "text": " Bye"},
+    ]}
+    assert _segments_from_whisper_json(data) == [Segment(0.0, 2.5, "Hello there."),
+                                                 Segment(3.0, 61.25, "Bye")]
+    assert _segments_from_whisper_json({}) == []
+
+
+def test_chunk_bounds_short_is_one_chunk():
+    import numpy as np
+
+    from vibeflow.transcribe import _chunk_bounds
+
+    assert _chunk_bounds(np.zeros(16000 * 30, dtype=np.int16), 16000) == [(0, 16000 * 30)]
+
+
+def test_chunk_bounds_cuts_at_quiet_spot():
+    import numpy as np
+
+    from vibeflow.transcribe import _chunk_bounds
+
+    rate = 1000
+    x = np.full(rate * 100, 1000, dtype=np.int16)
+    quiet = 25 * rate  # quiet window 5 s before the 30 s limit
+    x[quiet:quiet + rate] = 0
+    bounds = _chunk_bounds(x, rate, max_s=30, search_s=10)
+    assert bounds[0][0] == 0 and bounds[-1][1] == len(x)
+    assert abs(bounds[0][1] - (quiet + rate // 2)) <= rate // 2
+    assert all(b - a <= 30 * rate for a, b in bounds)
+    assert all(bounds[i][1] == bounds[i + 1][0] for i in range(len(bounds) - 1))
+
+
+def _write_wav(path, seconds, rate=16000):
+    import wave
+
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(b"\x00\x00" * int(seconds * rate))
+
+
+class _Resp:
+    def __init__(self, status=200, body=None, text=""):
+        self.status_code = status
+        self._body = body
+        self.text = text
+
+    def json(self):
+        if self._body is None:
+            raise ValueError("no json")
+        return self._body
+
+
+def test_cloud_segments_offsets_applied(tmp_path, monkeypatch):
+    import threading
+
+    import requests
+
+    from vibeflow.transcribe import CloudWhisper, Segment
+
+    wav = tmp_path / "a.wav"
+    _write_wav(wav, 3)
+    monkeypatch.setattr("vibeflow.transcribe._chunk_bounds",
+                        lambda s, r, **k: [(0, 16000), (16000, 48000)])
+    sent = []
+
+    def post(url, headers=None, files=None, data=None, timeout=None):
+        sent.append(data["response_format"])
+        return _Resp(200, {"segments": [{"start": 0.5, "end": 1.0, "text": " hi "}]})
+
+    monkeypatch.setattr(requests, "post", post)
+    prog = []
+    segs = CloudWhisper("groq", "k", "whisper-large-v3").transcribe_segments(
+        wav, "auto", 3.0, prog.append, threading.Event())
+    assert segs == [Segment(0.5, 1.0, "hi"), Segment(1.5, 2.0, "hi")]
+    assert sent == ["verbose_json", "verbose_json"]
+    assert prog == [0.5, 1.0]
+
+
+def test_cloud_segments_json_fallback(tmp_path, monkeypatch):
+    import threading
+
+    import requests
+
+    from vibeflow.transcribe import CloudWhisper, Segment
+
+    wav = tmp_path / "a.wav"
+    _write_wav(wav, 2)
+    sent = []
+
+    def post(url, headers=None, files=None, data=None, timeout=None):
+        sent.append(data["response_format"])
+        if data["response_format"] == "verbose_json":
+            return _Resp(400, text="unsupported")
+        return _Resp(200, {"text": " plain text "})
+
+    monkeypatch.setattr(requests, "post", post)
+    segs = CloudWhisper("openai", "k", "gpt-4o-transcribe").transcribe_segments(
+        wav, "en", 2.0, lambda f: None, threading.Event())
+    assert sent == ["verbose_json", "json"]
+    assert segs == [Segment(0.0, 2.0, "plain text")]
+
+
+def test_cloud_segments_cancel(tmp_path, monkeypatch):
+    import threading
+
+    import requests
+
+    from vibeflow.transcribe import CloudWhisper, TranscriptionCancelled
+
+    wav = tmp_path / "a.wav"
+    _write_wav(wav, 1)
+    monkeypatch.setattr(requests, "post", lambda *a, **k: pytest.fail("should not post"))
+    ev = threading.Event()
+    ev.set()
+    with pytest.raises(TranscriptionCancelled):
+        CloudWhisper("groq", "k", "m").transcribe_segments(wav, "auto", 1.0, lambda f: None, ev)
+
+
+class _VadSeg:
+    def __init__(self, start, end, text):
+        self.start, self.end, self.text = start, end, text
+
+
+def _parakeet_with_model(tmp_path, monkeypatch, model):
+    _install_fake_onnx_asr(monkeypatch, [])
+    t = make_transcriber(TranscriptionConfig(backend="parakeet", parakeet=_parakeet_cfg(tmp_path)))
+    t._ready.wait()
+    t._model = model
+    return t
+
+
+def test_parakeet_segments_progress_and_lock_released(tmp_path, monkeypatch):
+    import threading
+
+    from vibeflow.transcribe import Segment
+
+    holder = {}
+    lock_free = []
+
+    class Model:
+        def recognize(self, wav):
+            def gen():
+                for seg in (_VadSeg(0, 2, "One."), _VadSeg(2, 5, "[BLANK_AUDIO]"),
+                            _VadSeg(5, 10, " Two.")):
+                    lock_free.append(not holder["t"]._lock.locked())  # held only inside next()
+                    yield seg
+            return gen()
+
+    t = _parakeet_with_model(tmp_path, monkeypatch, Model())
+    holder["t"] = t
+    prog = []
+    segs = t.transcribe_segments(tmp_path / "a.wav", "en", 10.0, prog.append, threading.Event())
+    assert segs == [Segment(0.0, 2.0, "One."), Segment(5.0, 10.0, "Two.")]
+    assert prog == [0.2, 0.5, 1.0]
+    assert not t._lock.locked()
+    assert lock_free == [False, False, False]  # generator body runs inside the locked next()
+    assert t._cancelled is False
+
+
+def test_parakeet_segments_cancel_between_segments(tmp_path, monkeypatch):
+    import threading
+
+    from vibeflow.transcribe import TranscriptionCancelled
+
+    cancel = threading.Event()
+    pulled = []
+
+    class Model:
+        def recognize(self, wav):
+            def gen():
+                for i in range(5):
+                    pulled.append(i)
+                    yield _VadSeg(i, i + 1, f"s{i}")
+            return gen()
+
+    t = _parakeet_with_model(tmp_path, monkeypatch, Model())
+    with pytest.raises(TranscriptionCancelled):
+        t.transcribe_segments(tmp_path / "a.wav", "auto", 5.0,
+                              lambda f: cancel.set() if f >= 0.4 else None, cancel)
+    assert pulled == [0, 1]
+    assert not t._lock.locked() and t._cancelled is False
