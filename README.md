@@ -7,7 +7,7 @@ Wispr-Flow-style dictation for Windows. Hold a hotkey, speak, release: the trans
 - Push-to-talk (hold) and hands-free (double-tap) dictation, system-wide
 - Local transcription with whisper.cpp (small / medium models), or Groq / OpenAI Whisper API
 - Optional LLM cleanup of fillers, punctuation and casing: LM Studio (default), Groq, OpenAI, Anthropic
-- Transcribe existing audio/video files (mp3, m4a, mp4, mkv, ...) to plain text, timestamped text, SRT or VTT
+- Transcribe existing audio/video files (mp3, m4a, mp4, mkv, ...) to plain text, timestamped text, SRT, VTT or timed LRC lyrics
 - Tiny floating status pill that never steals focus
 - Tray icon: enable/disable, pick whisper model, pick cleanup model, launch at login
 - Settings window (tray left-click) for everything: hotkey, models, API keys, cleanup, output
@@ -72,6 +72,18 @@ Open **Settings > File**, click **Browse...** and pick an audio or video file (m
 - Audio is decoded locally with PyAV (FFmpeg is bundled), so no extra install is needed. LLM cleanup is not applied to file transcripts.
 - Use **Copy** or **Save as...** for the result; nothing is saved automatically. **Cancel** stops a running job.
 - Groq and OpenAI accept at most 25 MB per upload, so long files are split into chunks of up to 10 minutes and the timestamps are joined back together. Some models (for example `gpt-4o-transcribe`) return no timestamps; those files get one timestamp per chunk.
+
+## Song lyrics for Spodrive
+
+Turn songs into timed `.lrc` lyrics that the Spodrive web player can import:
+
+1. Open **Settings > File** and set **Format** to **Lyrics (LRC)**. For Croatian songs pick the `large-v3-turbo-hr` model on the **Transcription** tab; for songs in mixed languages use Parakeet v3.
+2. Click **Browse...** and select one or more songs, then click **Transcribe**. **Save next to each source file** is on by default for LRC, so every song gets `<song name>.lrc` in its own folder. Files run one after another ("File 2 of 5"), **Cancel** stops the batch, and a file that fails is reported while the rest continue.
+3. In Spodrive open **Settings > Import lyrics files (.lrc)** (or a track's menu > **Add lyrics file...**) and pick the `.lrc` files.
+
+- Each file starts with `[ti:]`, `[ar:]` and `[al:]` tags read from the song's metadata (the title falls back to the file name). Spodrive matches lyrics to tracks by those tags first, then by the file name.
+- Gaps longer than 4 seconds get an empty timed line, which Spodrive shows as a music note.
+- Music under the vocals lowers accuracy, so treat the result as a draft: open the `.lrc` in any text editor, fix it, then import.
 
 ## Portable build (exe)
 
@@ -207,7 +219,7 @@ vibeflow/
   hotkeys.py             global hotkey listener, chord parsing
   audio.py               microphone recording
   transcribe.py          whisper.cpp / Groq / OpenAI
-  filetranscribe.py      audio/video file decoding (PyAV) and text/SRT/VTT output
+  filetranscribe.py      audio/video file decoding (PyAV) and text/SRT/VTT/LRC output
   cleanup.py             LLM cleanup (LM Studio, Groq, OpenAI, Anthropic)
   inject.py              clipboard + paste / type
   overlay.py             status pill (tkinter)

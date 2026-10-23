@@ -1,4 +1,4 @@
-"""Transcribe audio/video files: PyAV decoding to 16 kHz mono WAV, backend orchestration, text/SRT/VTT renderers."""
+"""Transcribe audio/video files: PyAV decoding to 16 kHz mono WAV, backend orchestration, text/SRT/VTT/LRC renderers."""
 from __future__ import annotations
 
 import logging
@@ -14,18 +14,20 @@ from .transcribe import Segment, Transcriber, TranscriptionCancelled, Transcript
 
 log = logging.getLogger(__name__)
 
-FORMATS = ("plain", "timestamps", "srt", "vtt")
+FORMATS = ("plain", "timestamps", "srt", "vtt", "lrc")
 FORMAT_LABELS = {
     "plain": "Plain text",
     "timestamps": "Text with timestamps",
     "srt": "SRT subtitles",
     "vtt": "VTT subtitles",
+    "lrc": "Lyrics (LRC)",
 }
-FORMAT_EXT = {"plain": ".txt", "timestamps": ".txt", "srt": ".srt", "vtt": ".vtt"}
+FORMAT_EXT = {"plain": ".txt", "timestamps": ".txt", "srt": ".srt", "vtt": ".vtt", "lrc": ".lrc"}
 MEDIA_PATTERNS = ("*.mp3", "*.wav", "*.m4a", "*.aac", "*.flac", "*.ogg", "*.opus", "*.wma",
                   "*.mp4", "*.mkv", "*.mov", "*.avi", "*.webm")
 
 _RATE = 16000
+_LRC_GAP = 4.0  # seconds of silence after which an LRC line is closed with an empty timed line
 
 # (stage name, fraction 0..1 or None when unknown)
 StageFn = Callable[[str, "float | None"], None]
@@ -138,7 +140,66 @@ def _stamp(seconds: float, sep: str) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}{sep}{ms:03d}"
 
 
-def render(segments: list[Segment], fmt: str) -> str:
+def _lrc_stamp(seconds: float) -> str:
+    cs = max(0, int(round(seconds * 100 + 1e-6)))  # round once so 59.996 carries into the minute
+    m, rem = divmod(cs, 6000)
+    s, cs = divmod(rem, 100)
+    return f"[{m:02d}:{s:02d}.{cs:02d}]"
+
+
+def _render_lrc(segments: list[Segment], meta: dict | None) -> str:
+    if not segments:
+        return ""
+    meta = meta or {}
+    lines = []
+    for tag, key in (("ti", "title"), ("ar", "artist"), ("al", "album")):
+        value = " ".join(str(meta.get(key) or "").split())
+        if value:
+            lines.append(f"[{tag}:{value}]")
+    length = meta.get("length") or segments[-1].end
+    total = int(round(length))
+    lines.append(f"[length:{total // 60:02d}:{total % 60:02d}]")
+    lines.append("[re:VibeFlow]")
+    for i, s in enumerate(segments):
+        lines.append(f"{_lrc_stamp(s.start)} {' '.join(s.text.split())}".rstrip())
+        # Spodrive shows a music note for empty timed lines, so mark long instrumental gaps
+        nxt = segments[i + 1].start if i + 1 < len(segments) else meta.get("length")
+        if nxt is not None and nxt - s.end > _LRC_GAP:
+            lines.append(_lrc_stamp(s.end))
+    return "\n".join(lines)
+
+
+def output_path(src: Path, fmt: str) -> Path:
+    """`<source stem><ext>` next to the source file (used for batch / save-next-to-source)."""
+    src = Path(src)
+    return src.with_name(src.stem + FORMAT_EXT[fmt])
+
+
+def read_tags(src: Path) -> dict:
+    """Title/artist/album (+ `length` in seconds when known) from the container; title falls back to the stem. Never raises."""
+    src = Path(src)
+    tags = {"title": src.stem, "artist": "", "album": ""}
+    if _av_import_error():
+        return tags
+    try:
+        import av
+
+        with av.open(str(src)) as container:
+            found = {str(k).lower(): str(v).strip() for k, v in dict(container.metadata).items()}
+            if container.duration:
+                tags["length"] = container.duration / av.time_base
+    except Exception:  # noqa: BLE001  (not media, unreadable, broken FFmpeg)
+        log.debug("could not read tags from %s", src, exc_info=True)
+        return tags
+    for key in tags:
+        if found.get(key):
+            tags[key] = found[key]
+    return tags
+
+
+def render(segments: list[Segment], fmt: str, meta: dict | None = None) -> str:
+    if fmt == "lrc":
+        return _render_lrc(segments, meta)
     if fmt == "plain":
         return " ".join(s.text for s in segments)
     if fmt == "timestamps":
