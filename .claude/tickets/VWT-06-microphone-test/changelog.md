@@ -23,4 +23,4 @@ Outcome: mic chooser in Settings (new Microphone tab) and in the tray, with live
 - Run the manual checks from the plan (step 5b).
 
 ### Commit status
-- Committed on `VWT-06_microphone-test`; not pushed.
+- Committed on `VWT-06_microphone-test` as df37938; not pushed.
