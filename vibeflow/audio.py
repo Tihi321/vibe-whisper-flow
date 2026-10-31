@@ -479,12 +479,14 @@ def play(data, rate: int, cancel: threading.Event | None = None) -> None:
 
     arr = np.asarray(data).reshape(-1).astype("int16", copy=False)
     stream = None
+    opened = False
     try:
         with _PA_LOCK:
             sd = _sd()
             stream = sd.OutputStream(samplerate=rate, channels=1, dtype="int16")
             stream.start()
             _stream_opened()
+            opened = True
         chunk = max(1, int(rate * 0.1))
         for i in range(0, len(arr), chunk):
             if cancel is not None and cancel.is_set():
@@ -505,4 +507,5 @@ def play(data, rate: int, cancel: threading.Event | None = None) -> None:
                     stream.close()
                 except Exception:
                     pass
-                _stream_closed()
+                if opened:
+                    _stream_closed()

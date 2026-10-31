@@ -24,3 +24,5 @@ Outcome: mic chooser in Settings (new Microphone tab) and in the tray, with live
 
 ### Commit status
 - Committed on `VWT-06_microphone-test` as df37938; not pushed.
+
+- Fix: play() only decrements the open-stream counter if start() succeeded (stream still closed); test added in tests/test_audio.py.

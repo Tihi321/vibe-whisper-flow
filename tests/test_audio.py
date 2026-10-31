@@ -361,6 +361,15 @@ def test_play_error_closes_stream(fake):
     assert audio.open_stream_count() == 0
 
 
+def test_play_start_failure_keeps_counter(fake):
+    audio._stream_opened()  # another stream is live; its count must survive
+    fake.fail_start = True
+    with pytest.raises(AudioError, match="Could not play back"):
+        audio.play(np.zeros(1600, dtype=np.int16), 16000)
+    assert "close" in fake.streams[0].calls
+    assert audio.open_stream_count() == 1
+
+
 def test_write_wav_round_trip(tmp_path):
     import wave
 
