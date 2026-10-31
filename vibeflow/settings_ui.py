@@ -6,15 +6,17 @@ import ctypes
 import logging
 import os
 import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Any, Callable
 
-from . import filetranscribe, parakeet, whisper_setup
+from . import audio, filetranscribe, parakeet, whisper_setup
 from .cleanup import DEFAULT_PROMPT
 from .config import ROOT, Config, portable_path, resolve_path
 from .hotkeys import parse_chord
@@ -27,9 +29,16 @@ except ImportError:  # pragma: no cover
 
 log = logging.getLogger(__name__)
 
-TABS = ("general", "transcription", "file", "cleanup", "keys", "about")
-TAB_TITLES = {"general": "General", "transcription": "Transcription", "file": "File",
+TABS = ("general", "microphone", "transcription", "file", "cleanup", "keys", "about")
+TAB_TITLES = {"general": "General", "microphone": "Microphone", "transcription": "Transcription", "file": "File",
               "cleanup": "Cleanup", "keys": "API keys", "about": "About"}
+MIC_VERDICTS = {
+    "silent": "No signal (check Windows Settings > Privacy & security > Microphone)",
+    "quiet": "Too quiet: dictation would ignore this",
+    "ok": "Good",
+    "clipping": "Clipping",
+}
+DEFAULT_DEVICE_LABEL = "Windows default"
 BACKENDS = ("local", "parakeet", "groq", "openai")
 PROVIDERS = ("lmstudio", "groq", "openai", "anthropic", "none")
 LANGUAGES = ("auto", "en", "hr", "de", "fr", "es", "it", "pt", "nl", "pl", "ru", "uk", "ja", "zh")
@@ -161,6 +170,40 @@ def config_from_form(base: Config, form: dict[str, Any]) -> Config:
     return cfg
 
 
+# ---------------------------------------------------------------- microphone helpers
+
+def device_choices(names, default_name: str | None, saved: str) -> list[tuple[str, str]]:
+    """(label, value) pairs for the device combo; value "" is the Windows default."""
+    names = list(names)
+    first = f"{DEFAULT_DEVICE_LABEL} ({default_name})" if default_name else DEFAULT_DEVICE_LABEL
+    out = [(first, "")] + [(n, n) for n in names]
+    if saved and audio.match_device(saved, names) is None:
+        out.append((f"{saved} (not connected)", saved))
+    return out
+
+
+def device_label_for(saved: str, choices: list[tuple[str, str]], names) -> str:
+    """Label shown for the saved value; a legacy substring shows the device it matches."""
+    for label, value in choices:
+        if value == saved:
+            return label
+    hit = audio.match_device(saved, list(names))
+    return hit if hit is not None else choices[0][0]
+
+
+def engine_text(cfg: Config) -> str:
+    t = cfg.transcription
+    if t.backend == "local":
+        return f"Local (whisper.cpp), {_basename(t.local.model)}"
+    if t.backend == "parakeet":
+        return "Local (Parakeet v3)"
+    if t.backend == "groq":
+        return f"Groq API, {t.cloud.groq_model}"
+    if t.backend == "openai":
+        return f"OpenAI API, {t.cloud.openai_model}"
+    return t.backend
+
+
 # ---------------------------------------------------------------- hooks
 
 @dataclass
@@ -180,6 +223,9 @@ class SettingsHooks:
     audio_devices: Callable[[], list[str]]
     file_transcriber: Callable[[], Any]
     version: str = ""
+    default_audio_device: Callable[[], str | None] = lambda: None
+    refresh_audio_devices: Callable[[], bool] = lambda: False
+    test_transcribe: Callable[[Path, float, threading.Event], str] | None = None
 
 
 # ---------------------------------------------------------------- win32 / theme helpers
@@ -246,6 +292,14 @@ class SettingsWindow:
         self._file_srcs: list[Path] = []
         self._file_meta: dict | None = None  # tags + length of the single-file result, for LRC
         self._file_lang_init = False
+        # Microphone tab state: outside self._vars (the form never sees it).
+        self._mic_monitor: audio.InputMonitor | None = None
+        self._mic_busy = False
+        self._mic_cancel = threading.Event()
+        self._mic_poll_id: str | None = None
+        self._mic_quiet_since: float | None = None
+        self._mic_phase = ""
+        self._mic_rec_until = 0.0
 
     # -- public -----------------------------------------------------------
     def is_visible(self) -> bool:
@@ -300,6 +354,7 @@ class SettingsWindow:
 
     def hide(self) -> None:
         if self.top is not None:
+            self._mic_stop_meter()
             try:
                 self.top.withdraw()
             except tk.TclError:
@@ -375,11 +430,13 @@ class SettingsWindow:
             self._nb.add(f, text=TAB_TITLES[name])
             frames[name] = f
         self._build_general(frames["general"])
+        self._build_microphone(frames["microphone"])
         self._build_transcription(frames["transcription"])
         self._build_file(frames["file"])
         self._build_cleanup(frames["cleanup"])
         self._build_keys(frames["keys"])
         self._build_about(frames["about"])
+        self._nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
         top.update_idletasks()
         self._win32_polish()
 
@@ -461,14 +518,6 @@ class SettingsWindow:
                         command=self._on_autostart).grid(
             row=6, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
-        au = ttk.LabelFrame(f, text="Audio", padding=10)
-        au.pack(fill="x", pady=(10, 0))
-        self._device_combo = self._combo(au, 0, "Input device", "audio_device", [], width=44)
-        ttk.Label(au, text="Leave blank for the Windows default microphone.",
-                  foreground="gray").grid(row=1, column=1, sticky="w")
-        self._entry(au, 2, "Silence threshold", "silence_threshold", 8,
-                    hint="0..1, quieter is ignored")
-
         out = ttk.LabelFrame(f, text="Output and pill", padding=10)
         out.pack(fill="x", pady=(10, 0))
         self._combo(out, 0, "Output mode", "output_mode", OUTPUT_MODES, 10, readonly=True)
@@ -476,6 +525,14 @@ class SettingsWindow:
         self._check(out, 2, "Restore clipboard after pasting", "restore_clipboard")
         self._check(out, 3, "Show status pill while dictating", "show_pill")
         self._combo(out, 4, "Pill position", "pill_position", PILL_POSITIONS, 10, readonly=True)
+
+    def _on_tab_changed(self, _event=None) -> None:
+        try:
+            current = self._nb.index(self._nb.select())
+        except tk.TclError:
+            return
+        if current != TABS.index("microphone"):
+            self._mic_stop_meter()
 
     def _check_chord(self) -> None:
         try:
@@ -1069,19 +1126,353 @@ class SettingsWindow:
         threading.Thread(target=run, name="vibeflow-file-transcribe", daemon=True).start()
 
     def _file_refresh_engine(self, cfg: Config) -> None:
-        t = cfg.transcription
-        if t.backend == "local":
-            text = f"Local (whisper.cpp), {_basename(t.local.model)}"
-        elif t.backend == "parakeet":
-            text = "Local (Parakeet v3)"
-        elif t.backend == "groq":
-            text = f"Groq API, {t.cloud.groq_model}"
-        elif t.backend == "openai":
-            text = f"OpenAI API, {t.cloud.openai_model}"
-        else:
-            text = t.backend
+        text = engine_text(cfg)
         self._file_engine.configure(
             text=f"Engine: {text}. Change it on the Transcription tab (save first).")
+
+    # -- Microphone -------------------------------------------------------------
+    def _build_microphone(self, f: ttk.Frame) -> None:
+        self._mic_label = tk.StringVar(value="")
+        self._mic_status_var = tk.StringVar(value="")
+        self._mic_level_var = tk.StringVar(value="")
+        self._mic_seconds = tk.StringVar(value="5")
+        self._mic_choices: list[tuple[str, str]] = []
+        self._mic_names: list[str] = []
+
+        dev = ttk.LabelFrame(f, text="Device", padding=10)
+        dev.pack(fill="x")
+        self._var("audio_device", "")  # hidden: the config value; the combo shows labels
+        ttk.Label(dev, text="Input device").grid(row=0, column=0, sticky="w", pady=3, padx=(0, 10))
+        self._device_combo = ttk.Combobox(dev, textvariable=self._mic_label, state="readonly",
+                                          width=44, values=[])
+        self._device_combo.grid(row=0, column=1, sticky="w", pady=3)
+        self._device_combo.bind("<<ComboboxSelected>>", self._mic_device_selected)
+        self._mic_refresh_btn = ttk.Button(dev, text="Refresh", command=self._mic_refresh)
+        self._mic_refresh_btn.grid(row=0, column=2, padx=(8, 0))
+        ttk.Label(dev, text="Windows default follows the recording device set in Windows "
+                  "Sound settings.", foreground="gray", wraplength=600,
+                  justify="left").grid(row=1, column=1, columnspan=2, sticky="w")
+        self._entry(dev, 2, "Silence threshold", "silence_threshold", 8,
+                    hint="0..1, quieter is ignored")
+
+        tf = ttk.LabelFrame(f, text="Test", padding=10)
+        tf.pack(fill="x", pady=(10, 0))
+        meter = ttk.Frame(tf)
+        meter.pack(fill="x")
+        self._mic_bar = ttk.Progressbar(meter, mode="determinate", length=260, maximum=100)
+        self._mic_bar.pack(side="left")
+        ttk.Label(meter, textvariable=self._mic_level_var, wraplength=330,
+                  justify="left").pack(side="left", padx=(10, 0))
+        row = ttk.Frame(tf)
+        row.pack(fill="x", pady=(8, 0))
+        self._mic_meter_btn = ttk.Button(row, text="Start meter", command=self._mic_toggle_meter)
+        self._mic_meter_btn.pack(side="left")
+        ttk.Label(row, text="Clip (s)").pack(side="left", padx=(16, 4))
+        self._mic_seconds_combo = ttk.Combobox(row, textvariable=self._mic_seconds, width=4,
+                                               values=["3", "5", "10"], state="readonly")
+        self._mic_seconds_combo.pack(side="left")
+        row2 = ttk.Frame(tf)
+        row2.pack(fill="x", pady=(8, 0))
+        self._mic_play_btn = ttk.Button(row2, text="Record and play back",
+                                        command=lambda: self._mic_record("play"))
+        self._mic_play_btn.pack(side="left")
+        self._mic_trans_btn = ttk.Button(row2, text="Record and transcribe",
+                                         command=lambda: self._mic_record("transcribe"))
+        self._mic_trans_btn.pack(side="left", padx=6)
+        self._mic_stop_btn = ttk.Button(row2, text="Stop", command=self._mic_cancel.set,
+                                        state="disabled")
+        self._mic_stop_btn.pack(side="left")
+        ttk.Label(tf, textvariable=self._mic_status_var, wraplength=620,
+                  justify="left").pack(anchor="w", pady=(8, 0))
+        self._mic_engine = ttk.Label(tf, text="", foreground="gray", wraplength=620,
+                                     justify="left")
+        self._mic_engine.pack(anchor="w", pady=(4, 0))
+        rf = ttk.Frame(tf)
+        rf.pack(fill="x", pady=(6, 0))
+        self._mic_text = tk.Text(rf, height=3, wrap="word", font=("Segoe UI", 9), state="disabled")
+        self._mic_text.pack(side="left", fill="x", expand=True)
+        ttk.Button(rf, text="Copy", command=self._mic_copy).pack(side="left", padx=(6, 0),
+                                                                 anchor="n")
+
+    def _mic_refresh_engine(self, cfg: Config) -> None:
+        self._mic_engine.configure(text=f"Engine: {engine_text(cfg)} (saved settings)")
+
+    def _mic_set_status(self, text: str) -> None:
+        self._mic_status_var.set(text)
+
+    def _mic_set_text(self, text: str) -> None:
+        self._mic_text.configure(state="normal")
+        self._mic_text.delete("1.0", "end")
+        self._mic_text.insert("1.0", text)
+        self._mic_text.configure(state="disabled")
+
+    def _mic_copy(self) -> None:
+        text = self._mic_text.get("1.0", "end").strip()
+        if text and self.top is not None:
+            self.top.clipboard_clear()
+            self.top.clipboard_append(text)
+            self._mic_set_status("Copied.")
+
+    def _mic_value(self) -> str:
+        return str(self._vars["audio_device"].get()).strip()
+
+    def _mic_rate(self) -> int:
+        try:
+            return int(self.hooks.get_config().audio.sample_rate) or 16000
+        except Exception:
+            return 16000
+
+    def _mic_threshold(self) -> float:
+        try:
+            return _float({"v": self._vars["silence_threshold"].get()}, "v", "Silence threshold",
+                          0.0, 1.0)
+        except ValueError:
+            return float(self.hooks.get_config().audio.silence_threshold)
+
+    def _mic_device_selected(self, _event=None) -> None:
+        label = self._mic_label.get()
+        for text, value in self._mic_choices:
+            if text == label:
+                self._vars["audio_device"].set(value)
+                break
+        m = self._mic_monitor
+        if m is not None and m.running and not self._mic_busy:
+            self._mic_stop_meter()
+            self._mic_start_meter()
+
+    def _mic_refresh(self) -> None:
+        if self._mic_busy:
+            return
+        self._mic_stop_meter()
+        self._mic_set_status("Refreshing devices...")
+
+        def run() -> None:
+            try:
+                ok = bool(self.hooks.refresh_audio_devices())
+            except Exception:  # noqa: BLE001
+                log.exception("device refresh failed")
+                ok = False
+
+            def done() -> None:
+                self._load_devices()
+                self._mic_set_status("Device list refreshed" if ok else
+                                     "Close the test and stop dictating to rescan devices")
+            self._post(lambda: self._safe_ui(done))
+        threading.Thread(target=run, name="vibeflow-mic-refresh", daemon=True).start()
+
+    def _mic_start_monitor(self) -> bool:
+        """Start the shared input monitor (and the poll loop). Shows errors in the status line."""
+        m = self._mic_monitor
+        if m is not None and m.running:
+            return True
+        self._mic_quiet_since = None
+        monitor = audio.InputMonitor(self._mic_value(), self._mic_rate())
+        try:
+            monitor.start()
+        except audio.AudioError as e:
+            self._mic_monitor = None
+            self._mic_set_status(str(e))
+            return False
+        self._mic_monitor = monitor
+        self._mic_schedule_poll()
+        return True
+
+    def _mic_start_meter(self) -> None:
+        if self._mic_start_monitor():
+            self._mic_meter_btn.configure(text="Stop meter")
+            self._mic_set_status("")
+
+    def _mic_toggle_meter(self) -> None:
+        m = self._mic_monitor
+        if m is not None and m.running:
+            if self._mic_busy:
+                return
+            self._mic_stop_meter()
+            self._mic_set_status("")
+        else:
+            self._mic_start_meter()
+
+    def _mic_stop_meter(self) -> None:
+        """Tk thread: stop the monitor and reset the meter."""
+        m, self._mic_monitor = self._mic_monitor, None
+        if m is not None:
+            m.stop()
+        self._mic_stop_ui()
+
+    def _mic_stop_ui(self) -> None:
+        if self._mic_poll_id is not None and self.top is not None:
+            try:
+                self.top.after_cancel(self._mic_poll_id)
+            except tk.TclError:
+                pass
+        self._mic_poll_id = None
+        self._mic_quiet_since = None
+        try:
+            self._mic_bar.configure(value=0)
+            self._mic_level_var.set("")
+            self._mic_meter_btn.configure(text="Start meter")
+        except (tk.TclError, AttributeError):
+            pass
+
+    def stop_mic_test(self) -> None:
+        """Thread-safe (called from quit() on another thread): cancel and close streams. No Tk."""
+        self._mic_cancel.set()
+        m = self._mic_monitor
+        if m is not None:
+            m.stop()
+
+    def _mic_schedule_poll(self) -> None:
+        if self.top is not None and self._mic_poll_id is None:
+            self._mic_poll_id = self.top.after(50, self._mic_poll)
+
+    def _mic_poll(self) -> None:
+        self._mic_poll_id = None
+        m = self._mic_monitor
+        if m is None or not m.running or self.top is None:
+            return
+        try:
+            peak, _rms, age = m.levels()
+            now = time.monotonic()
+            if age > 2.0:
+                label = m.device_label
+                self._mic_stop_meter()
+                self._mic_set_status(f"No audio from {label}. Is it unplugged?")
+                return
+            if peak < 1e-4:
+                if self._mic_quiet_since is None:
+                    self._mic_quiet_since = now
+            else:
+                self._mic_quiet_since = None
+            silent_for = 0.0 if self._mic_quiet_since is None else now - self._mic_quiet_since
+            verdict = audio.level_verdict(peak, self._mic_threshold(), silent_for)
+            self._mic_bar.configure(value=audio.meter_percent(peak))
+            self._mic_level_var.set(f"{audio.level_db(peak):.0f} dB  {MIC_VERDICTS[verdict]}")
+            if self._mic_phase == "recording":
+                left = max(0.0, self._mic_rec_until - now)
+                self._mic_set_status(f"Recording {left:.0f} s... speak now")
+        except tk.TclError:
+            return
+        self._mic_schedule_poll()
+
+    def _mic_set_busy_ui(self, busy: bool) -> None:
+        self._mic_play_btn.configure(state="disabled" if busy else "normal")
+        self._mic_trans_btn.configure(state="disabled" if busy else "normal")
+        self._mic_refresh_btn.configure(state="disabled" if busy else "normal")
+        self._mic_stop_btn.configure(state="normal" if busy else "disabled")
+
+    def _mic_record(self, mode: str) -> None:
+        if self._mic_busy:
+            return
+        try:
+            seconds = float(self._mic_seconds.get())
+        except ValueError:
+            seconds = 5.0
+        was_running = self._mic_monitor is not None and self._mic_monitor.running
+        self._mic_cancel.clear()
+        if not self._mic_start_monitor():
+            return
+        if not was_running:
+            self._mic_meter_btn.configure(text="Stop meter")
+        monitor = self._mic_monitor
+        assert monitor is not None
+        rate = self._mic_rate()
+        threshold = self._mic_threshold()
+        hook = self.hooks.test_transcribe
+        self._mic_busy = True
+        self._mic_phase = "recording"
+        self._mic_rec_until = time.monotonic() + seconds
+        self._mic_set_busy_ui(True)
+        self._mic_set_status(f"Recording {seconds:.0f} s... speak now")
+        if mode == "transcribe":
+            self._mic_set_text("")
+        monitor.begin_capture()
+
+        def ui(fn: Callable[[], None]) -> None:
+            self._post(lambda: self._safe_ui(fn))
+
+        def recorded() -> None:
+            self._mic_phase = ""
+
+        def run() -> None:
+            final = "Stopped."
+            result: str | None = None
+            try:
+                self._mic_cancel.wait(seconds)
+                data = monitor.end_capture()
+                ui(recorded)
+                if self._mic_cancel.is_set():
+                    return
+                if len(data) == 0:
+                    final = "No audio captured."
+                    return
+                peak = audio._levels(data)[0]
+                note = f"Peak {audio.level_db(peak):.0f} dB."
+                if peak < threshold:
+                    note += (" Dictation would ignore this recording "
+                             f"(silence threshold {threshold:g}).")
+                if mode == "play":
+                    ui(lambda: self._mic_set_status("Playing back..."))
+                    try:
+                        audio.play(data, rate, self._mic_cancel)
+                    except audio.AudioError as e:
+                        final = f"{e} {note}"
+                        return
+                    final = "Stopped." if self._mic_cancel.is_set() else f"Done. {note}"
+                    return
+                if hook is None:
+                    final = "Transcription test is not available."
+                    return
+                ui(lambda: self._mic_set_status("Transcribing..."))
+                path = Path(tempfile.gettempdir()) / "vibeflow" / (
+                    f"mictest-{datetime.now().strftime('%Y%m%d-%H%M%S')}.wav")
+                try:
+                    audio.write_wav(path, data, rate)
+                    text = hook(path, len(data) / float(rate), self._mic_cancel)
+                except TranscriptionCancelled:
+                    return
+                except TranscriptionError as e:
+                    final = f"Transcription failed: {e}"
+                    return
+                except Exception as e:  # noqa: BLE001
+                    log.exception("mic test transcription failed")
+                    final = f"Transcription failed: {e}"
+                    return
+                finally:
+                    try:
+                        path.unlink()
+                    except OSError:
+                        pass
+                if self._mic_cancel.is_set():
+                    return
+                result = text or ""
+                final = f"Done. {note}" if text else f"No speech recognised. {note}"
+            except Exception as e:  # noqa: BLE001
+                log.exception("mic test failed")
+                final = f"Microphone test failed: {e}"
+            finally:
+                def finish() -> None:
+                    self._mic_busy = False
+                    self._mic_phase = ""
+                    self._mic_set_busy_ui(False)
+                    if result is not None:
+                        self._mic_set_text(result)
+                    self._mic_set_status(final)
+                    if not was_running:
+                        self._mic_stop_meter()
+                ui(finish)
+
+        threading.Thread(target=run, name="vibeflow-mictest", daemon=True).start()
+
+    def sync_audio_device(self, value: str) -> None:
+        """Tk thread: a tray switch changed the saved mic. Follow it unless the form has an
+        unsaved choice of its own."""
+        var = self._vars.get("audio_device")
+        if var is None:
+            return
+        if str(var.get()) == str(self._snapshot.get("audio_device", "")):
+            var.set(value)
+            self._snapshot["audio_device"] = value
+            self._load_devices()
 
     # -- Cleanup ---------------------------------------------------------------
     def _build_cleanup(self, f: ttk.Frame) -> None:
@@ -1247,6 +1638,7 @@ class SettingsWindow:
             pass
         self._refresh_models()
         self._file_refresh_engine(cfg)
+        self._mic_refresh_engine(cfg)
         if not self._file_lang_init:  # initial language only; the File tab never persists it
             self._file_lang.set(cfg.transcription.language or "auto")
             self._file_lang_init = True
@@ -1255,10 +1647,18 @@ class SettingsWindow:
 
     def _load_devices(self) -> None:
         try:
-            names = ["", *self.hooks.audio_devices()]
+            names = list(self.hooks.audio_devices())
         except Exception:
-            names = [""]
-        self._device_combo.configure(values=names)
+            names = []
+        try:
+            default = self.hooks.default_audio_device()
+        except Exception:
+            default = None
+        saved = self._mic_value()
+        self._mic_names = names
+        self._mic_choices = device_choices(names, default, saved)
+        self._device_combo.configure(values=[label for label, _ in self._mic_choices])
+        self._mic_label.set(device_label_for(saved, self._mic_choices, names))
 
     def _collect(self) -> dict[str, Any]:
         form = {k: v.get() for k, v in self._vars.items()}
@@ -1323,6 +1723,7 @@ class SettingsWindow:
                                    ((k, var.get().strip()) for k, var in self._env_vars.items())})
         self._refresh_models()
         self._file_refresh_engine(cfg)
+        self._mic_refresh_engine(cfg)
         if err:
             self._set_status(f"Saved, but: {err}")
             messagebox.showwarning("VibeFlow", err, parent=self.top)

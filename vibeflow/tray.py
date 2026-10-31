@@ -36,6 +36,12 @@ class TrayHooks:
     open_logs: Callable[[], None]
     reload_config: Callable[[], None]
     quit: Callable[[], None]
+    input_devices: Callable[[], list[str]] = lambda: []
+    default_input_device: Callable[[], str | None] = lambda: None
+    current_input_device: Callable[[], str] = lambda: ""
+    set_input_device: Callable[[str], None] = lambda _n: None
+    refresh_input_devices: Callable[[], bool] = lambda: False
+    open_mic_test: Callable[[], None] = lambda: None
 
 
 def make_icon(color: str) -> Image.Image:
@@ -124,6 +130,7 @@ class Tray:
             M("Enabled", act(lambda: h.set_enabled(not h.is_enabled())), checked=chk(h.is_enabled)),
             pystray.Menu.SEPARATOR,
             M("Transcription", pystray.Menu(*trans_items)),
+            M("Microphone", pystray.Menu(*self._mic_items())),
             M("Cleanup model", pystray.Menu(*clean_items)),
             pystray.Menu.SEPARATOR,
             M("Launch at login", act(lambda: h.set_autostart(not h.is_autostart())),
@@ -134,6 +141,50 @@ class Tray:
             pystray.Menu.SEPARATOR,
             M("Quit", act(h.quit)),
         ]
+
+    def _mic_items(self) -> list:
+        from .audio import match_device
+
+        h = self.hooks
+        M = pystray.MenuItem
+        act = self._action
+        chk = self._checked
+
+        try:
+            names = list(h.input_devices())
+        except Exception:
+            log.exception("input_devices failed")
+            names = []
+        try:
+            default = h.default_input_device()
+        except Exception:
+            default = None
+        try:
+            current = h.current_input_device() or ""
+        except Exception:
+            current = ""
+
+        items = [M(f"Windows default ({default})" if default else "Windows default",
+                   act(h.set_input_device, ""),
+                   checked=chk(lambda: (h.current_input_device() or "") == ""), radio=True)]
+        for name in names:
+            items.append(M(name, act(h.set_input_device, name),
+                           checked=chk(lambda n=name: match_device(h.current_input_device() or "", names) == n),
+                           radio=True))
+        if current and match_device(current, names) is None:
+            items.append(M(f"{current} (not connected)", act(lambda: None),
+                           checked=lambda item: True, radio=True, enabled=False))
+        if not names:
+            items.append(M("No microphones found", act(lambda: None), enabled=False))
+        items.append(pystray.Menu.SEPARATOR)
+        items.append(M("Refresh list", act(self._refresh_mics)))
+        items.append(M("Test microphone…", act(h.open_mic_test)))
+        return items
+
+    def _refresh_mics(self) -> None:
+        if not self.hooks.refresh_input_devices():
+            self.notify("VibeFlow", "Microphone list not rescanned: stop the microphone test "
+                                    "and any dictation, then try again.")
 
     def _pick_whisper(self, path: Path) -> None:
         self.hooks.set_whisper_model(str(path))  # app side also switches backend to local

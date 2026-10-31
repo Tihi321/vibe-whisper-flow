@@ -55,13 +55,25 @@ A microphone icon appears in the tray. Left-click it to open the Settings window
 
 ## Settings window
 
-Open it with a left-click on the tray icon or **Settings...** in the tray menu. Tabs: **General**, **Transcription**, **File**, **Cleanup**, **API keys**, **About**.
+Open it with a left-click on the tray icon or **Settings...** in the tray menu. Tabs: **General**, **Microphone**, **Transcription**, **File**, **Cleanup**, **API keys**, **About**.
 
 - Closing the window with **X** only hides it to the tray; **Quit** is available from the tray menu only.
 - The **Show this window when VibeFlow starts** checkbox is saved immediately. Uncheck it to start silently in the tray.
 - Launching VibeFlow again while it is already running brings the window up instead of starting a second copy.
 - Launch at login starts VibeFlow hidden (`--hidden`).
 - The Transcription tab downloads whisper models and the whisper engine (CPU or CUDA). API keys are written to `.env`.
+
+## Choose and test the microphone
+
+Pick the microphone on **Settings > Microphone** or from the tray (**Microphone** submenu; the choice is saved immediately). The list shows one entry per microphone. **Windows default** follows the recording device set in Windows Sound settings.
+
+- **Refresh** (also in the tray submenu) rescans for microphones plugged in after VibeFlow started. It is refused while the microphone test or a dictation is running; stop them and try again.
+- **Start meter** shows a live level bar in dB with a verdict: "No signal", "Too quiet: dictation would ignore this" (below the silence threshold), "Good" or "Clipping". The meter uses the device selected in the box, even before you save.
+- **Record and play back** records a 3, 5 or 10 second clip and plays it on the default output.
+- **Record and transcribe** records a clip and shows the raw text from the saved transcription backend (no LLM cleanup).
+- **Stop** ends a recording, playback or transcription. The tests also work while you dictate.
+- If the saved microphone is not connected, dictation uses the Windows default and shows a one-time notice; the saved name is kept, so the microphone is used again when plugged back in. The test itself says "<name> is not connected".
+- If the meter shows "No signal", check Windows Settings > Privacy & security > Microphone.
 
 ## Transcribe a file
 
@@ -194,7 +206,7 @@ Caveats:
 |---|---|
 | No tray icon | Run `python run.pyw --console` and read `logs\vibeflow.log`; check the hidden-icons overflow |
 | `whisper-cli.exe not found` | Install the engine from the Settings window (Transcription tab), re-run `scripts\setup-whisper.ps1`, or check `[transcription.local].whisper_cli` |
-| "No microphone" / wrong mic | Set `[audio].device` to part of the device name. List devices: `python -c "import sounddevice as sd; print(sd.query_devices())"` |
+| "No microphone" / wrong mic | Pick it on Settings > Microphone (or tray > Microphone), then use **Start meter** and **Record and play back** to check it. Plugged it in after starting? Click **Refresh**. Power users can still set `[audio].device` to part of a device name |
 | LM Studio unreachable | Check the server is started and the port matches `[cleanup].base_url`; the pill shows "Pasted (raw)" meanwhile |
 | Paste does nothing in some app | It is probably elevated (see Permissions), or use `[output].mode = "type"` |
 | "No speech detected" on quiet speech, or noise triggers transcriptions | Tune `[audio] silence_threshold = 0.01`: recordings whose peak level is below it are dropped (this prevents whisper's "you" / "Thank you." hallucinations on silence). Raise it if background noise triggers transcriptions, lower it if quiet speech gets dropped |
@@ -217,7 +229,7 @@ requirements-build.txt   build dependencies (PyInstaller)
 vibeflow/
   app.py                 state machine, pipeline, wiring
   hotkeys.py             global hotkey listener, chord parsing
-  audio.py               microphone recording
+  audio.py               microphone recording, device list, level meter, playback
   transcribe.py          whisper.cpp / Groq / OpenAI
   filetranscribe.py      audio/video file decoding (PyAV) and text/SRT/VTT/LRC output
   cleanup.py             LLM cleanup (LM Studio, Groq, OpenAI, Anthropic)

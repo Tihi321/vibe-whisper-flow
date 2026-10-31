@@ -274,6 +274,7 @@ class DictationApp:
         self._models_cache: list[str] = []
         self._models_at = 0.0
         self._models_refreshing = False
+        self._missing_mic_warned: set[str] = set()
 
         try:
             self.chord = parse_chord(cfg.hotkey.chord)
@@ -308,6 +309,12 @@ class DictationApp:
             open_logs=self._open_logs,
             reload_config=self.reload_config,
             quit=self.quit,
+            input_devices=self._audio_devices,
+            default_input_device=self._default_audio_device,
+            current_input_device=lambda: self.cfg.audio.device,
+            set_input_device=self._set_input_device,
+            refresh_input_devices=self._refresh_audio_devices,
+            open_mic_test=lambda: self.open_settings(tab="microphone"),
         )
         self.tray = Tray(hooks)
 
@@ -468,6 +475,9 @@ class DictationApp:
                 open_logs=self._open_logs,
                 open_config=self._open_config,
                 audio_devices=self._audio_devices,
+                default_audio_device=self._default_audio_device,
+                refresh_audio_devices=self._refresh_audio_devices,
+                test_transcribe=self._test_transcribe,
                 file_transcriber=self._file_transcriber,
                 version=__version__,
             )
@@ -528,6 +538,39 @@ class DictationApp:
         except Exception:
             return []
 
+    def _default_audio_device(self) -> str | None:
+        try:
+            return self._audio.default_input_name()
+        except Exception:
+            return None
+
+    def _refresh_audio_devices(self) -> bool:
+        """Rescan PortAudio devices (refused while a stream is open). Safe from any thread."""
+        try:
+            ok = self._audio.refresh_devices()
+        except self._audio.AudioError as e:
+            log.warning("device refresh failed: %s", e)
+            ok = False
+        self.tray.update_menu()
+        return ok
+
+    def _set_input_device(self, name: str) -> None:
+        """Tray: pick the microphone and save it. The recorder shares cfg.audio, so the next
+        start() uses it without a rebuild."""
+        self.cfg.audio.device = name
+        self._save()
+        self._missing_mic_warned.discard(name)
+        self._flash("ok", "Microphone: " + _short(name or "Windows default", 48))
+        if self.settings is not None:
+            self.overlay.call_soon(lambda: self.settings.sync_audio_device(name))
+
+    def _test_transcribe(self, wav: Path, seconds: float, cancel: threading.Event) -> str:
+        """Mic test: transcribe a clip with the saved backend, raw text, off the hotkey path."""
+        t = self._file_transcriber()
+        segs = t.transcribe_segments(
+            wav, self.cfg.transcription.language, seconds, lambda _f: None, cancel)
+        return " ".join(s.text for s in segs).strip()
+
     def _open_config(self) -> None:
         os.startfile(str(config_path()))  # type: ignore[attr-defined]
 
@@ -538,7 +581,12 @@ class DictationApp:
             self._quit_done = True
         log.info("quitting")
         self._gen += 1
-        steps = [self.listener.stop, self.tray.stop, self.recorder.discard]
+        steps = [
+            self.listener.stop,
+            self.tray.stop,
+            self.recorder.discard,
+            lambda: self.settings is not None and self.settings.stop_mic_test(),
+        ]
         if self._instance is not None:
             steps.append(self._instance.close)
         steps.append(self.overlay.quit)  # tears down the Tk root and the settings window with it
@@ -588,12 +636,20 @@ class DictationApp:
         if self._transcriber is None:
             self._flash("error", "Error: " + _short(self._transcriber_error or "no transcriber", 53))
             return False
+        if self.recorder.cfg is not self.cfg.audio:
+            self.recorder = self._audio.Recorder(self.cfg.audio)
         try:
             self.recorder.start()
         except Exception as e:
             log.error("could not start recording: %s", e)
             self._flash("error", "Error: " + _short(str(e), 53))
             return False
+        name = self.cfg.audio.device
+        if getattr(self.recorder, "fell_back", False) and name not in self._missing_mic_warned:
+            self._missing_mic_warned.add(name)
+            msg = _short(f"{name} not found, using Windows default", 60)
+            self._flash("error", msg, 2.5)
+            self.tray.notify("VibeFlow", msg)
         return True
 
     def discard_recording(self) -> None:
