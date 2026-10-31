@@ -80,7 +80,8 @@ def test_base_not_mutated():
     assert base == before
 
 
-def _hooks(cfg: Config, tmp_path: Path, applied: list, file_transcriber=None) -> SettingsHooks:
+def _hooks(cfg: Config, tmp_path: Path, applied: list, file_transcriber=None,
+           **overrides) -> SettingsHooks:
     noop = lambda *a, **k: None  # noqa: E731
     return SettingsHooks(
         get_config=lambda: copy.deepcopy(cfg),
@@ -92,6 +93,7 @@ def _hooks(cfg: Config, tmp_path: Path, applied: list, file_transcriber=None) ->
         active_model_path=lambda: tmp_path / "ggml-small.bin",
         open_logs=noop, open_config=noop, audio_devices=lambda: ["Mic A"],
         file_transcriber=file_transcriber or (lambda: None), version="0.0.0",
+        **overrides,
     )
 
 
@@ -254,12 +256,13 @@ class _Pump:
     def post(self, fn):
         self.q.put(fn)
 
-    def wait(self, win, timeout=10):
+    def wait(self, win, timeout=10, until=None):
         import queue
         import time
 
         deadline = time.time() + timeout
-        while win._file_busy and time.time() < deadline:
+        busy = until or (lambda: win._file_busy)
+        while busy() and time.time() < deadline:
             try:
                 self.q.get(timeout=0.02)()
             except queue.Empty:
@@ -415,5 +418,280 @@ def test_file_tab_lrc_batch_writes_next_to_sources(tmp_path, monkeypatch):
         assert not (tmp_path / "bad.lrc").exists()  # one failure does not stop the batch
         status = win._file_status_var.get()
         assert status.startswith("Wrote 2 of 3") and "bad.mp3: broken file" in status
+    finally:
+        root.destroy()
+
+
+# ---------------------------------------------------------------- Microphone tab (VWT-06)
+
+def test_device_choices_and_labels():
+    ch = settings_ui.device_choices(["Mic A", "Mic B"], "Mic A", "")
+    assert ch == [("Windows default (Mic A)", ""), ("Mic A", "Mic A"), ("Mic B", "Mic B")]
+    assert settings_ui.device_choices(["Mic A"], None, "")[0][0] == "Windows default"
+    ch = settings_ui.device_choices(["Mic A"], None, "Ghost")
+    assert ch[-1] == ("Ghost (not connected)", "Ghost")
+    assert settings_ui.device_label_for("Ghost", ch, ["Mic A"]) == "Ghost (not connected)"
+    ch = settings_ui.device_choices(["USB Mic B"], None, "usb")
+    assert len(ch) == 2  # legacy substring matches: nothing appended
+    assert settings_ui.device_label_for("usb", ch, ["USB Mic B"]) == "USB Mic B"
+    assert settings_ui.device_label_for("", ch, ["USB Mic B"]) == "Windows default"
+
+
+def test_engine_text_all_backends():
+    cfg = Config()
+    cfg.transcription.local.model = "D:\\m\\ggml-small.bin"
+    cfg.transcription.backend = "local"
+    assert settings_ui.engine_text(cfg) == "Local (whisper.cpp), ggml-small.bin"
+    cfg.transcription.backend = "parakeet"
+    assert settings_ui.engine_text(cfg) == "Local (Parakeet v3)"
+    cfg.transcription.backend = "groq"
+    assert settings_ui.engine_text(cfg).startswith("Groq API, ")
+    cfg.transcription.backend = "openai"
+    assert settings_ui.engine_text(cfg).startswith("OpenAI API, ")
+
+
+class FakeMonitor:
+    instances: list = []
+    peak = 0.3
+    fail = None
+
+    def __init__(self, device, sample_rate=16000, block_seconds=0.05):
+        self.device = device
+        self.sample_rate = sample_rate
+        self.device_label = device or "Windows default"
+        self.running = False
+        self.captured = False
+        FakeMonitor.instances.append(self)
+
+    def start(self):
+        if FakeMonitor.fail:
+            raise settings_ui.audio.AudioError(FakeMonitor.fail)
+        self.running = True
+
+    def stop(self):
+        self.running = False
+
+    def levels(self):
+        return FakeMonitor.peak, FakeMonitor.peak, 0.0
+
+    def begin_capture(self):
+        self.captured = True
+
+    def end_capture(self):
+        import numpy as np
+
+        return np.full(1600, 3000, dtype=np.int16)
+
+
+def _mic_window(tmp_path, monkeypatch, pump, cfg=None, **hook_kw):
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("no display")
+    root.withdraw()
+    FakeMonitor.instances = []
+    FakeMonitor.peak = 0.3
+    FakeMonitor.fail = None
+    monkeypatch.setattr(settings_ui.audio, "InputMonitor", FakeMonitor)
+    win = SettingsWindow(root, _hooks(cfg or Config(), tmp_path, [], **hook_kw), pump.post)
+    win.show("microphone")
+    root.update()
+    return root, win
+
+
+def test_microphone_tab_device_pick_and_save(tmp_path):
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("no display")
+    root.withdraw()
+    applied: list = []
+    try:
+        win = SettingsWindow(
+            root, _hooks(Config(), tmp_path, applied,
+                         default_audio_device=lambda: "Mic A"), lambda fn: fn())
+        win.show("microphone")
+        root.update()
+        assert "microphone" in settings_ui.TABS
+        assert tuple(win._device_combo.cget("values")) == ("Windows default (Mic A)", "Mic A")
+        assert win._mic_label.get() == "Windows default (Mic A)"
+        assert not win._is_dirty()
+        win._mic_label.set("Mic A")
+        win._device_combo.event_generate("<<ComboboxSelected>>")
+        root.update()
+        assert win._vars["audio_device"].get() == "Mic A"
+        assert win._is_dirty()
+        assert win.save()
+        assert applied[-1][0].audio.device == "Mic A"
+        assert not win._is_dirty()
+    finally:
+        root.destroy()
+
+
+def test_sync_audio_device_keeps_clean_form_clean(tmp_path):
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("no display")
+    root.withdraw()
+    try:
+        win = SettingsWindow(root, _hooks(Config(), tmp_path, []), lambda fn: fn())
+        win.show("microphone")
+        win.sync_audio_device("Mic A")
+        assert win._vars["audio_device"].get() == "Mic A"
+        assert win._mic_label.get() == "Mic A"
+        assert not win._is_dirty()
+        win._vars["audio_device"].set("Other")  # user edit: tray must not override it
+        win.sync_audio_device("Mic B")
+        assert win._vars["audio_device"].get() == "Other"
+    finally:
+        root.destroy()
+
+
+def test_mic_record_and_play(tmp_path, monkeypatch):
+    pump = _Pump(None)
+    played = []
+    monkeypatch.setattr(settings_ui.audio, "play",
+                        lambda data, rate, cancel=None: played.append((len(data), rate)))
+    root, win = _mic_window(tmp_path, monkeypatch, pump)
+    pump.root = root
+    try:
+        win._mic_seconds.set("3")
+        win._mic_cancel.wait = lambda timeout=None: False  # do not really wait
+        win._mic_record("play")
+        assert win._mic_busy
+        pump.wait(win, until=lambda: win._mic_busy)
+        assert played == [(1600, 16000)]
+        assert win._mic_status_var.get().startswith("Done.")
+        assert "Peak" in win._mic_status_var.get()
+        assert not FakeMonitor.instances[0].running  # was not running before: stopped again
+        assert not win._is_dirty()
+    finally:
+        root.destroy()
+
+
+def test_mic_record_and_transcribe(tmp_path, monkeypatch):
+    pump = _Pump(None)
+    seen = {}
+
+    def hook(path, seconds, cancel):
+        seen["exists"] = path.exists()
+        seen["path"] = path
+        seen["seconds"] = seconds
+        return "hello there"
+
+    monkeypatch.setattr(settings_ui.tempfile, "gettempdir", lambda: str(tmp_path))
+    root, win = _mic_window(tmp_path, monkeypatch, pump, test_transcribe=hook)
+    pump.root = root
+    try:
+        win._mic_cancel.wait = lambda timeout=None: False
+        win._mic_record("transcribe")
+        pump.wait(win, until=lambda: win._mic_busy)
+        assert win._mic_text.get("1.0", "end").strip() == "hello there"
+        assert win._mic_status_var.get().startswith("Done.")
+        assert seen["exists"] and abs(seen["seconds"] - 0.1) < 1e-9
+        assert not seen["path"].exists()  # temp WAV deleted
+    finally:
+        root.destroy()
+
+
+def test_mic_transcribe_error_and_missing_hook(tmp_path, monkeypatch):
+    from vibeflow.transcribe import TranscriptionError
+
+    pump = _Pump(None)
+
+    def hook(path, seconds, cancel):
+        raise TranscriptionError("whisper model not found")
+
+    monkeypatch.setattr(settings_ui.tempfile, "gettempdir", lambda: str(tmp_path))
+    root, win = _mic_window(tmp_path, monkeypatch, pump, test_transcribe=hook)
+    pump.root = root
+    try:
+        win._mic_cancel.wait = lambda timeout=None: False
+        win._mic_record("transcribe")
+        pump.wait(win, until=lambda: win._mic_busy)
+        assert "Transcription failed: whisper model not found" in win._mic_status_var.get()
+        assert not list((tmp_path / "vibeflow").glob("mictest-*.wav"))
+        win.hooks.test_transcribe = None
+        win._mic_record("transcribe")
+        pump.wait(win, until=lambda: win._mic_busy)
+        assert "not available" in win._mic_status_var.get()
+    finally:
+        root.destroy()
+
+
+def test_mic_stop_cancels(tmp_path, monkeypatch):
+    pump = _Pump(None)
+    called = []
+    monkeypatch.setattr(settings_ui.audio, "play", lambda *a, **k: called.append(1))
+    root, win = _mic_window(tmp_path, monkeypatch, pump)
+    pump.root = root
+    try:
+        win._mic_seconds.set("10")
+        win._mic_record("play")
+        assert win._mic_busy
+        win._mic_cancel.set()  # the Stop button
+        pump.wait(win, until=lambda: win._mic_busy)
+        assert win._mic_status_var.get() == "Stopped."
+        assert called == []
+    finally:
+        root.destroy()
+
+
+def test_mic_start_error_shown(tmp_path, monkeypatch):
+    pump = _Pump(None)
+    root, win = _mic_window(tmp_path, monkeypatch, pump)
+    pump.root = root
+    try:
+        FakeMonitor.fail = "Ghost is not connected"
+        win._mic_toggle_meter()
+        assert win._mic_status_var.get() == "Ghost is not connected"
+        assert win._mic_monitor is None
+    finally:
+        root.destroy()
+
+
+def test_mic_silence_timer(tmp_path, monkeypatch):
+    pump = _Pump(None)
+    root, win = _mic_window(tmp_path, monkeypatch, pump)
+    pump.root = root
+    clock = [100.0]
+    monkeypatch.setattr(settings_ui.time, "monotonic", lambda: clock[0])
+    try:
+        FakeMonitor.peak = 0.0
+        win._mic_toggle_meter()
+        win.top.after_cancel(win._mic_poll_id)
+        win._mic_poll_id = None
+        win._mic_poll()
+        assert win._mic_quiet_since == 100.0
+        assert "No signal" not in win._mic_level_var.get()
+        clock[0] = 101.0
+        win._mic_poll()
+        assert "No signal" not in win._mic_level_var.get()
+        clock[0] = 101.6
+        win._mic_poll()
+        assert "No signal" in win._mic_level_var.get()
+        FakeMonitor.peak = 0.5  # a loud block resets the timer
+        win._mic_poll()
+        assert win._mic_quiet_since is None
+        assert "Good" in win._mic_level_var.get()
+        win._mic_stop_meter()
+    finally:
+        root.destroy()
+
+
+def test_mic_watchdog_unplugged(tmp_path, monkeypatch):
+    pump = _Pump(None)
+    root, win = _mic_window(tmp_path, monkeypatch, pump)
+    pump.root = root
+    try:
+        win._mic_toggle_meter()
+        win.top.after_cancel(win._mic_poll_id)
+        win._mic_poll_id = None
+        mon = win._mic_monitor
+        mon.levels = lambda: (0.0, 0.0, 2.5)
+        win._mic_poll()
+        assert "Is it unplugged?" in win._mic_status_var.get()
+        assert win._mic_monitor is None and not mon.running
     finally:
         root.destroy()

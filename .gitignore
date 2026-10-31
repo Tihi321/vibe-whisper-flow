@@ -6,6 +6,7 @@ logs/
 __pycache__/
 *.pyc
 .claude/temp/
+.claude/director/
 .pytest_cache/
 *.egg-info/
 build/
